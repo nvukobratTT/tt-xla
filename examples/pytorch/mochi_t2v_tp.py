@@ -228,6 +228,11 @@ class MochiT2VTPPipeline:
         device = torch_xla.device()
         self.transformer = self.transformer.to(device)
 
+        # Patch attention processor for TT compatibility
+        # (removes torch.nonzero, dynamic indexing, strided slicing)
+        from mochi_tt_compat import patch_mochi_for_tt
+        patch_mochi_for_tt(self.transformer)
+
         print("  Applying tensor-parallel sharding...")
         apply_tp_sharding_mochi_transformer(self.transformer, self.mesh)
 
@@ -304,7 +309,7 @@ class MochiT2VTPPipeline:
 
         self.scheduler.set_timesteps(num_inference_steps, device="cpu")
         timesteps = self.scheduler.timesteps
-        latents = latents * self.scheduler.init_noise_sigma
+        # FlowMatch scheduler doesn't use init_noise_sigma — latents are used as-is
 
         device = torch_xla.device()
         do_cfg = guidance_scale > 1.0 and neg_embeds is not None
