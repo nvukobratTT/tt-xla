@@ -1,0 +1,657 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Wan2.1-T2V-14B Text-to-Video Pipeline with Tensor Parallelism across 4 Blackhole chips.
+
+Strategy: Megatron-style TP for the 14B transformer.
+- 40 attention heads / 4 devices = 10 heads per device
+- QKV projections: column-parallel (shard output dim)
+- Output projection: row-parallel (shard input dim) + all-reduce
+- FFN up/gate: column-parallel
+- FFN down: row-parallel + all-reduce
+- Pre-processing (rope, patch_embedding, condition_embedder) on CPU
+- VAE and text encoder on CPU
+
+This reduces per-device attention from (1, 40, seq, 128) to (1, 10, seq, 128),
+which should bring tt-mlir compilation time from hours to minutes.
+"""
+
+import argparse
+import gc
+import math
+import os
+import time
+import types
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import torch
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.spmd as xs
+import torch_xla.runtime as xr
+from torch_xla.distributed.spmd import Mesh
+
+
+def export_to_video(frames: np.ndarray, output_path: str, fps: int = 16):
+    """Export frames to video, trying available backends."""
+    try:
+        from diffusers.utils import export_to_video as diffusers_export
+        diffusers_export(list(frames), output_path, fps=fps)
+        return
+    except Exception:
+        pass
+
+    try:
+        import imageio
+        writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
+        for frame in frames:
+            writer.append_data(frame)
+        writer.close()
+        return
+    except ImportError:
+        pass
+
+    raise RuntimeError(
+        "No video export backend available. Install imageio-ffmpeg or opencv-python."
+    )
+
+
+def apply_tp_sharding_wan_block(block, mesh, num_devices):
+    """
+    Apply Megatron-style tensor parallel sharding to a single WanTransformerBlock.
+    
+    Block structure:
+        attn1 (self-attention): to_q, to_k, to_v [5120, 5120], to_out.0 [5120, 5120]
+            norm_q, norm_k [5120] — per-head norms, must be sharded
+        attn2 (cross-attention): to_q [5120, 5120], to_k [5120, 5120], to_v [5120, 5120], to_out.0 [5120, 5120]
+            add_k_proj, add_v_proj [5120, 5120] (for added KV from encoder)
+            norm_q, norm_k [5120]
+        ffn.net.0.proj [13824, 5120] (GELU up-projection)
+        ffn.net.2 [5120, 13824] (down-projection)
+    
+    Sharding strategy:
+        Q/K/V projections: column-parallel — ("model", None) on weight
+        Output projection: row-parallel — (None, "model") on weight
+        FFN up: column-parallel — ("model", None) on weight
+        FFN down: row-parallel — (None, "model") on weight
+    """
+    shard_specs = {}
+
+    # Self-attention (attn1)
+    shard_specs[block.attn1.to_q.weight] = ("model", None)     # column-parallel
+    shard_specs[block.attn1.to_q.bias] = ("model",)
+    shard_specs[block.attn1.to_k.weight] = ("model", None)     # column-parallel
+    shard_specs[block.attn1.to_k.bias] = ("model",)
+    shard_specs[block.attn1.to_v.weight] = ("model", None)     # column-parallel
+    shard_specs[block.attn1.to_v.bias] = ("model",)
+    shard_specs[block.attn1.to_out[0].weight] = (None, "model")  # row-parallel
+    shard_specs[block.attn1.to_out[0].bias] = (None,)           # replicated
+    # Per-head norms (5120 = 40 heads * 128 dim_head)
+    shard_specs[block.attn1.norm_q.weight] = ("model",)
+    shard_specs[block.attn1.norm_k.weight] = ("model",)
+
+    # Cross-attention (attn2)
+    shard_specs[block.attn2.to_q.weight] = ("model", None)
+    shard_specs[block.attn2.to_q.bias] = ("model",)
+    shard_specs[block.attn2.to_k.weight] = ("model", None)
+    shard_specs[block.attn2.to_k.bias] = ("model",)
+    shard_specs[block.attn2.to_v.weight] = ("model", None)
+    shard_specs[block.attn2.to_v.bias] = ("model",)
+    shard_specs[block.attn2.to_out[0].weight] = (None, "model")
+    shard_specs[block.attn2.to_out[0].bias] = (None,)
+    shard_specs[block.attn2.norm_q.weight] = ("model",)
+    shard_specs[block.attn2.norm_k.weight] = ("model",)
+
+    # Cross-attention added KV projections (from encoder hidden states)
+    if hasattr(block.attn2, 'add_k_proj') and block.attn2.add_k_proj is not None:
+        shard_specs[block.attn2.add_k_proj.weight] = ("model", None)
+        shard_specs[block.attn2.add_k_proj.bias] = ("model",)
+    if hasattr(block.attn2, 'add_v_proj') and block.attn2.add_v_proj is not None:
+        shard_specs[block.attn2.add_v_proj.weight] = ("model", None)
+        shard_specs[block.attn2.add_v_proj.bias] = ("model",)
+
+    # FFN: ffn.net.0.proj (up, GELU) — column-parallel
+    shard_specs[block.ffn.net[0].proj.weight] = ("model", None)
+    shard_specs[block.ffn.net[0].proj.bias] = ("model",)
+    # FFN: ffn.net.2 (down) — row-parallel
+    shard_specs[block.ffn.net[2].weight] = (None, "model")
+    shard_specs[block.ffn.net[2].bias] = (None,)               # replicated
+
+    return shard_specs
+
+
+def apply_tp_sharding_wan_transformer(transformer, mesh, num_devices):
+    """
+    Apply tensor-parallel sharding to all 40 blocks of the WanTransformer3DModel.
+    
+    The pre-processing modules (patch_embedding, condition_embedder, rope) stay on CPU
+    and are not sharded. Only the transformer blocks + final norm/proj are sharded.
+    """
+    all_specs = {}
+
+    for i, block in enumerate(transformer.blocks):
+        block_specs = apply_tp_sharding_wan_block(block, mesh, num_devices)
+        all_specs.update(block_specs)
+
+    # Apply all sharding annotations
+    for tensor, spec in all_specs.items():
+        xs.mark_sharding(tensor, mesh, spec)
+
+    print(f"  Applied TP sharding to {len(transformer.blocks)} blocks ({len(all_specs)} tensors)")
+    return all_specs
+
+
+def patch_transformer_with_tp(transformer, mesh, num_devices):
+    """
+    Monkey-patch the WanTransformer3DModel forward for TP execution:
+    1. Pre-processing on CPU (rope, patch_embedding, condition_embedder)
+    2. Transfer to TT device — inputs are replicated across all devices
+    3. Run blocks with SPMD — XLA handles the sharded matmuls + all-reduces
+    4. Insert xm.mark_step() between blocks for incremental compilation
+    """
+    from diffusers.models.transformers.transformer_wan import Transformer2DModelOutput
+
+    def forward_with_tp(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_image: torch.Tensor | None = None,
+        return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor | dict[str, Any]:
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.config.patch_size
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
+
+        tt_device = xm.xla_device()
+
+        # === Phase 1: Pre-processing on CPU ===
+        hidden_cpu = hidden_states.to("cpu")
+        timestep_cpu = timestep.to("cpu")
+        encoder_cpu = encoder_hidden_states.to("cpu")
+
+        # Move preprocessing modules to CPU
+        self.rope = self.rope.to("cpu")
+        self.patch_embedding = self.patch_embedding.to("cpu")
+        self.condition_embedder = self.condition_embedder.to("cpu")
+
+        with torch.no_grad():
+            rotary_emb = self.rope(hidden_cpu)
+
+            hidden_states = self.patch_embedding(hidden_cpu)
+            hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+            if timestep_cpu.ndim == 2:
+                ts_seq_len = timestep_cpu.shape[1]
+                timestep_flat = timestep_cpu.flatten()
+            else:
+                ts_seq_len = None
+                timestep_flat = timestep_cpu
+
+            temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
+                timestep_flat, encoder_cpu,
+                encoder_hidden_states_image.to("cpu") if encoder_hidden_states_image is not None else None,
+                timestep_seq_len=ts_seq_len,
+            )
+            if ts_seq_len is not None:
+                timestep_proj = timestep_proj.unflatten(2, (6, -1))
+            else:
+                timestep_proj = timestep_proj.unflatten(1, (6, -1))
+
+            if encoder_hidden_states_image is not None:
+                encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+
+        print(f"    Pre-processing done on CPU. hidden={hidden_states.shape}, temb={temb.shape}", flush=True)
+
+        # Move preprocessing modules back to TT device
+        self.rope = self.rope.to(tt_device)
+        self.patch_embedding = self.patch_embedding.to(tt_device)
+        self.condition_embedder = self.condition_embedder.to(tt_device)
+
+        # === Phase 2: Transfer to TT device (replicated across all chips) ===
+        hidden_states = hidden_states.to(dtype=torch.bfloat16, device=tt_device)
+        encoder_hidden_states = encoder_hidden_states.to(dtype=torch.bfloat16, device=tt_device)
+        timestep_proj = timestep_proj.to(dtype=torch.bfloat16, device=tt_device)
+        if isinstance(rotary_emb, (tuple, list)):
+            rotary_emb = tuple(r.to(dtype=torch.bfloat16, device=tt_device) for r in rotary_emb)
+        else:
+            rotary_emb = rotary_emb.to(dtype=torch.bfloat16, device=tt_device)
+
+        # Mark inputs as replicated (not sharded) — SPMD will handle the sharded matmuls
+        xs.mark_sharding(hidden_states, mesh, (None, None, None))
+        xs.mark_sharding(encoder_hidden_states, mesh, (None, None, None))
+        if timestep_proj.ndim == 3:
+            xs.mark_sharding(timestep_proj, mesh, (None, None, None))
+        elif timestep_proj.ndim == 4:
+            xs.mark_sharding(timestep_proj, mesh, (None, None, None, None))
+        # rotary_emb: mark each tensor in tuple as replicated
+        if isinstance(rotary_emb, (tuple, list)):
+            for r in rotary_emb:
+                spec = tuple(None for _ in range(r.ndim))
+                xs.mark_sharding(r, mesh, spec)
+
+        xm.mark_step()
+
+        # === Phase 3: Transformer blocks with graph breaks ===
+        # With SPMD + TP, XLA will compile sharded graphs — each device only compiles
+        # for its shard of the attention heads (10 heads instead of 40)
+        for i, block in enumerate(self.blocks):
+            block_start = time.time()
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+            xm.mark_step()
+            block_time = time.time() - block_start
+            print(f"      Block {i+1}/{len(self.blocks)} done ({block_time:.1f}s)", flush=True)
+
+        # === Phase 4: Output projection ===
+        temb = temb.to(dtype=torch.bfloat16, device=tt_device)
+        if temb.ndim == 3:
+            shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
+            shift = shift.squeeze(2)
+            scale = scale.squeeze(2)
+        else:
+            shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
+
+        shift = shift.to(hidden_states.device)
+        scale = scale.to(hidden_states.device)
+
+        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = self.proj_out(hidden_states)
+        xm.mark_step()
+
+        hidden_states = hidden_states.reshape(
+            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+        )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+        if not return_dict:
+            return (output,)
+
+        return Transformer2DModelOutput(sample=output)
+
+    transformer.forward = types.MethodType(forward_with_tp, transformer)
+    print(f"  Patched transformer forward with TP + graph breaks ({len(transformer.blocks)} blocks)")
+
+
+class WanT2VTPConfig:
+    """Configuration for Wan2.1-T2V pipeline with tensor parallelism."""
+
+    def __init__(
+        self,
+        model_id: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        height: int = 480,
+        width: int = 832,
+        num_frames: int = 81,
+    ):
+        self.model_id = model_id
+        self.height = height
+        self.width = width
+        self.num_frames = num_frames
+
+
+class WanT2VTPPipeline:
+    """
+    Wan2.1 T2V pipeline with tensor parallelism across multiple Blackhole chips.
+    """
+
+    def __init__(self, config: WanT2VTPConfig):
+        self.config = config
+        self.transformer = None
+        self.vae = None
+        self.text_encoder = None
+        self.tokenizer = None
+        self.scheduler = None
+        self.mesh = None
+        self.num_devices = None
+
+    def load_models(self):
+        """Load all model components and apply TP sharding to transformer."""
+        from diffusers import AutoencoderKLWan, UniPCMultistepScheduler
+        from diffusers.models import WanTransformer3DModel
+        from transformers import T5TokenizerFast, UMT5EncoderModel
+
+        # Setup SPMD mesh
+        os.environ["CONVERT_SHLO_TO_SHARDY"] = "1"
+        xr.use_spmd()
+
+        self.num_devices = xr.global_runtime_device_count()
+        device_ids = np.array(range(self.num_devices))
+        self.mesh = Mesh(device_ids, (1, self.num_devices), ("batch", "model"))
+
+        print(f"SPMD enabled with {self.num_devices} devices")
+        print(f"Mesh: {self.mesh}")
+
+        # Validate head count divisibility
+        num_heads = 40  # Wan2.1-T2V-14B has 40 attention heads
+        if num_heads % self.num_devices != 0:
+            raise ValueError(
+                f"Number of attention heads ({num_heads}) must be divisible by "
+                f"number of devices ({self.num_devices}) for head-parallel TP."
+            )
+        print(f"  {num_heads} heads / {self.num_devices} devices = {num_heads // self.num_devices} heads per device")
+
+        print(f"\nLoading models from {self.config.model_id}...")
+        start = time.time()
+
+        # 1. Text encoder — CPU
+        print("  Loading text encoder (UMT5-XXL)...")
+        self.tokenizer = T5TokenizerFast.from_pretrained(
+            self.config.model_id, subfolder="tokenizer"
+        )
+        self.text_encoder = UMT5EncoderModel.from_pretrained(
+            self.config.model_id,
+            subfolder="text_encoder",
+            torch_dtype=torch.bfloat16,
+        ).to("cpu")
+        self.text_encoder.eval()
+
+        # 2. VAE — CPU
+        print("  Loading VAE...")
+        self.vae = AutoencoderKLWan.from_pretrained(
+            self.config.model_id,
+            subfolder="vae",
+            torch_dtype=torch.float32,
+        ).to("cpu")
+        self.vae.eval()
+
+        # 3. Scheduler
+        print("  Loading scheduler...")
+        self.scheduler = UniPCMultistepScheduler.from_pretrained(
+            self.config.model_id, subfolder="scheduler"
+        )
+
+        # 4. Transformer — load then move to XLA device with TP sharding
+        print("  Loading transformer (14B)...")
+        self.transformer = WanTransformer3DModel.from_pretrained(
+            self.config.model_id,
+            subfolder="transformer",
+            torch_dtype=torch.bfloat16,
+        )
+        self.transformer.eval()
+
+        # Move to XLA device first, then apply sharding
+        print("  Moving transformer to XLA device...")
+        device = torch_xla.device()
+        self.transformer = self.transformer.to(device)
+
+        # Apply TP sharding annotations
+        print("  Applying tensor-parallel sharding...")
+        apply_tp_sharding_wan_transformer(self.transformer, self.mesh, self.num_devices)
+
+        # Patch forward for CPU pre-processing + graph breaks
+        patch_transformer_with_tp(self.transformer, self.mesh, self.num_devices)
+
+        elapsed = time.time() - start
+        print(f"Models loaded and sharded in {elapsed:.1f}s")
+
+    def encode_prompt(self, prompt: str, negative_prompt: str = "", max_sequence_length: int = 512):
+        """Encode text prompt using UMT5."""
+        print("Encoding prompt...")
+
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+
+        with torch.no_grad():
+            prompt_embeds = self.text_encoder(
+                text_inputs.input_ids.to("cpu"),
+                attention_mask=text_inputs.attention_mask.to("cpu"),
+            )[0]
+        prompt_embeds = prompt_embeds.to(dtype=torch.bfloat16)
+
+        negative_prompt_embeds = None
+        if negative_prompt:
+            uncond_inputs = self.tokenizer(
+                negative_prompt,
+                padding="max_length",
+                max_length=max_sequence_length,
+                truncation=True,
+                return_attention_mask=True,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                negative_prompt_embeds = self.text_encoder(
+                    uncond_inputs.input_ids.to("cpu"),
+                    attention_mask=uncond_inputs.attention_mask.to("cpu"),
+                )[0]
+            negative_prompt_embeds = negative_prompt_embeds.to(dtype=torch.bfloat16)
+
+        return prompt_embeds, negative_prompt_embeds
+
+    def prepare_latents(self, batch_size, num_channels, height, width, num_frames, generator=None):
+        """Prepare random latent noise."""
+        vae_temporal_compression = 4
+        vae_spatial_compression = 8
+
+        latent_num_frames = (num_frames - 1) // vae_temporal_compression + 1
+        latent_height = height // vae_spatial_compression
+        latent_width = width // vae_spatial_compression
+
+        shape = (batch_size, num_channels, latent_num_frames, latent_height, latent_width)
+        latents = torch.randn(shape, generator=generator, dtype=torch.float32, device="cpu")
+
+        return latents
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        num_inference_steps: int = 50,
+        guidance_scale: float = 5.0,
+        seed: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+    ) -> np.ndarray:
+        """Generate a video from text prompt using TP."""
+        num_frames = num_frames or self.config.num_frames
+        height = height or self.config.height
+        width = width or self.config.width
+
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(prompt, negative_prompt)
+
+        generator = torch.Generator(device="cpu")
+        if seed is not None:
+            generator.manual_seed(seed)
+
+        num_channels = 16
+        latents = self.prepare_latents(
+            batch_size=1, num_channels=num_channels,
+            height=height, width=width, num_frames=num_frames,
+            generator=generator,
+        )
+
+        self.scheduler.set_timesteps(num_inference_steps, device="cpu")
+        timesteps = self.scheduler.timesteps
+        latents = latents * self.scheduler.init_noise_sigma
+        mask = torch.ones_like(latents)
+
+        tt_device = torch_xla.device()
+        tt_cast = lambda x: x.to(dtype=torch.bfloat16, device=tt_device)
+        cpu_cast = lambda x: x.to(device="cpu", dtype=torch.float32)
+
+        print(f"Running denoising loop ({num_inference_steps} steps)...", flush=True)
+        loop_start = time.time()
+
+        for i, t in enumerate(timesteps):
+            step_start = time.time()
+            print(f"  Step {i+1}/{num_inference_steps} (t={t.item():.2f})", flush=True)
+
+            latent_model_input = latents.to(dtype=torch.bfloat16)
+
+            temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
+            timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+
+            latent_input_tt = tt_cast(latent_model_input)
+            timestep_tt = tt_cast(timestep)
+            prompt_embeds_tt = tt_cast(prompt_embeds)
+
+            noise_pred = self.transformer(
+                hidden_states=latent_input_tt,
+                timestep=timestep_tt,
+                encoder_hidden_states=prompt_embeds_tt,
+            )
+            if hasattr(noise_pred, "sample"):
+                noise_pred = noise_pred.sample
+            noise_pred = cpu_cast(noise_pred)
+
+            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
+                neg_embeds_tt = tt_cast(negative_prompt_embeds)
+                noise_pred_uncond = self.transformer(
+                    hidden_states=latent_input_tt,
+                    timestep=timestep_tt,
+                    encoder_hidden_states=neg_embeds_tt,
+                )
+                if hasattr(noise_pred_uncond, "sample"):
+                    noise_pred_uncond = noise_pred_uncond.sample
+                noise_pred_uncond = cpu_cast(noise_pred_uncond)
+
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
+
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            step_time = time.time() - step_start
+            print(f"    Step took {step_time:.2f}s", flush=True)
+
+        loop_time = time.time() - loop_start
+        print(f"Denoising complete in {loop_time:.1f}s ({loop_time/num_inference_steps:.1f}s/step)")
+
+        # VAE decode on CPU
+        print("Decoding latents with VAE...", flush=True)
+        decode_start = time.time()
+
+        latents = latents.to(dtype=self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = (
+            1.0
+            / torch.tensor(self.vae.config.latents_std)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents = latents / latents_std + latents_mean
+        video = self.vae.decode(latents, return_dict=False)[0]
+
+        decode_time = time.time() - decode_start
+        print(f"VAE decode took {decode_time:.1f}s")
+
+        video = video.float().cpu()
+        video = (video.clamp(-1, 1) + 1) / 2 * 255
+        video = video[0].permute(1, 2, 3, 0).to(torch.uint8).numpy()
+
+        return video
+
+
+def run_wan_tp_pipeline(
+    prompt: str = "A serene lake surrounded by mountains at sunset",
+    negative_prompt: str = "",
+    num_inference_steps: int = 50,
+    guidance_scale: float = 5.0,
+    height: int = 480,
+    width: int = 832,
+    num_frames: int = 81,
+    seed: Optional[int] = 42,
+    output_path: str = "output_video_tp.mp4",
+    optimization_level: int = 1,
+):
+    """Run the Wan T2V pipeline with tensor parallelism."""
+    torch_xla.set_custom_compile_options({"optimization_level": optimization_level})
+
+    config = WanT2VTPConfig(
+        height=height,
+        width=width,
+        num_frames=num_frames,
+    )
+    pipeline = WanT2VTPPipeline(config)
+    pipeline.load_models()
+
+    video_frames = pipeline.generate(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        seed=seed,
+    )
+
+    print(f"Generated {video_frames.shape[0]} frames at {video_frames.shape[1]}x{video_frames.shape[2]}")
+    export_to_video(video_frames, output_path, fps=16)
+    print(f"Video saved to: {output_path}")
+
+    return output_path
+
+
+def test_wan_t2v_tp():
+    """Quick test: 1 denoising step at minimum resolution to verify TP compilation works."""
+    xr.set_device_type("TT")
+
+    output_path = "test_wan_tp_output.mp4"
+    if Path(output_path).exists():
+        Path(output_path).unlink()
+
+    try:
+        run_wan_tp_pipeline(
+            prompt="a cat",
+            num_inference_steps=1,
+            height=256,
+            width=256,
+            num_frames=9,
+            output_path=output_path,
+        )
+        assert Path(output_path).exists(), f"Output video {output_path} was not created"
+        print(f"Test passed: video created at {output_path}")
+    finally:
+        if Path(output_path).exists():
+            Path(output_path).unlink()
+            print(f"Cleaned up {output_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Wan2.1-T2V-14B with Tensor Parallelism on Blackhole")
+    parser.add_argument("--prompt", type=str, default="A serene lake surrounded by mountains at sunset")
+    parser.add_argument("--negative_prompt", type=str, default="")
+    parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--guidance_scale", type=float, default=5.0)
+    parser.add_argument("--height", type=int, default=256)
+    parser.add_argument("--width", type=int, default=256)
+    parser.add_argument("--num_frames", type=int, default=9)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output_dir", type=str, default="generated_videos")
+    parser.add_argument("--optimization_level", type=int, default=1)
+    args = parser.parse_args()
+
+    xr.set_device_type("TT")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    filename = args.prompt[:50].lower().replace(" ", "_")
+    filename = "".join(c if c.isalnum() or c == "_" else "" for c in filename)
+    output_path = os.path.join(args.output_dir, f"{filename}_tp.mp4")
+
+    run_wan_tp_pipeline(
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        num_inference_steps=args.num_inference_steps,
+        guidance_scale=args.guidance_scale,
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
+        seed=args.seed,
+        output_path=output_path,
+        optimization_level=args.optimization_level,
+    )
