@@ -1,0 +1,444 @@
+- program_created:
+    id: 4
+    timestamp_ns: 1774176381770799198
+- program_created:
+    id: 6
+    timestamp_ns: 1774176381770822453
+- program_created:
+    id: 5
+    timestamp_ns: 1774176381770829165
+- program_created:
+    id: 7
+    timestamp_ns: 1774176381770836079
+- program_compile_started:
+    id: 7
+    timestamp_ns: 1774176381771168054
+- program_compile_started:
+    id: 5
+    timestamp_ns: 1774176381771189786
+- program_compile_started:
+    id: 6
+    timestamp_ns: 1774176381771196739
+- program_compile_started:
+    id: 4
+    timestamp_ns: 1774176381771251043
+- program_kernel_compile_finished:
+    id: 7
+    timestamp_ns: 1774176381774448173
+    duration_ns: 3280119
+    watcher_kernel_id: 18
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/11318144607776535940/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 4
+    timestamp_ns: 1774176381774459444
+    duration_ns: 3208401
+    watcher_kernel_id: 32
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/15952600875368568023/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 6
+    timestamp_ns: 1774176381774464644
+    duration_ns: 3267905
+    watcher_kernel_id: 31
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/12680008585778388939/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 5
+    timestamp_ns: 1774176381774643096
+    duration_ns: 3453310
+    watcher_kernel_id: 19
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/9270442628980300511/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 7
+    timestamp_ns: 1774176381774751072
+    duration_ns: 3583018
+    watcher_kernel_id: 13
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/1931154385533966251/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 5
+    timestamp_ns: 1774176381774757154
+    duration_ns: 3567368
+    watcher_kernel_id: 23
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/12771110966090167769/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 7
+    timestamp_ns: 1774176381774763797
+    duration_ns: 3595743
+    watcher_kernel_id: 24
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/6400072283801524350/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 5
+    timestamp_ns: 1774176381774770199
+    duration_ns: 3580413
+    watcher_kernel_id: 14
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/5689169619052613162/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 7
+    timestamp_ns: 1774176381774775669
+    duration_ns: 3607615
+    watcher_kernel_id: 9
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/15297551045637746005/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 7
+    timestamp_ns: 1774176381774778294
+    duration_ns: 3610240
+    watcher_kernel_id: 15
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/10129978892172930710/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 7
+    timestamp_ns: 1774176381774786911
+    duration_ns: 3618857
+    watcher_kernel_id: 5
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/17899143957790546581/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 5
+    timestamp_ns: 1774176381774813762
+    duration_ns: 3623976
+    watcher_kernel_id: 30
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/16184017440458153619/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 5
+    timestamp_ns: 1774176381774844481
+    duration_ns: 3654695
+    watcher_kernel_id: 27
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/2833192098568114765/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 7
+    timestamp_ns: 1774176381774960984
+    duration_ns: 3792930
+    watcher_kernel_id: 22
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/4142539638778957652/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 7
+    timestamp_ns: 1774176381775257502
+    duration_ns: 4089448
+    watcher_kernel_id: 1
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/7845393496514354698/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 4
+    timestamp_ns: 1774176381776798431
+    duration_ns: 5547388
+    watcher_kernel_id: 29
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/3798939963124536729/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 5
+    timestamp_ns: 1774176381777306583
+    duration_ns: 6116797
+    watcher_kernel_id: 10
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/10025964194113368596/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 5
+    timestamp_ns: 1774176381777660531
+    duration_ns: 6470745
+    watcher_kernel_id: 6
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/12313201369233760909/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 5
+    timestamp_ns: 1774176381777675039
+    duration_ns: 6485253
+    watcher_kernel_id: 4
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/4349398854380702306/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_compile_finished:
+    id: 7
+    timestamp_ns: 1774176381777755984
+    duration_ns: 6587930
+- program_kernel_compile_finished:
+    id: 4
+    timestamp_ns: 1774176381777958531
+    duration_ns: 6707488
+    watcher_kernel_id: 26
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/6932944151346237009/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 6
+    timestamp_ns: 1774176381777988799
+    duration_ns: 6792060
+    watcher_kernel_id: 28
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/14893553203121362205/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_compile_finished:
+    id: 5
+    timestamp_ns: 1774176381780004658
+    duration_ns: 8814872
+- program_kernel_compile_finished:
+    id: 6
+    timestamp_ns: 1774176381780191746
+    duration_ns: 8995007
+    watcher_kernel_id: 25
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/12477022948991197609/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 4
+    timestamp_ns: 1774176381780251811
+    duration_ns: 9000768
+    watcher_kernel_id: 2
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/16139166888850161212/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 4
+    timestamp_ns: 1774176381780385086
+    duration_ns: 9134043
+    watcher_kernel_id: 8
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/9162572702629841315/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 4
+    timestamp_ns: 1774176381780503322
+    duration_ns: 9252279
+    watcher_kernel_id: 12
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/13162160896215282506/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 4
+    timestamp_ns: 1774176381781241325
+    duration_ns: 9990282
+    watcher_kernel_id: 17
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/7143200437841305288/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 4
+    timestamp_ns: 1774176381781287593
+    duration_ns: 10036550
+    watcher_kernel_id: 21
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/4780116890538333623/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 6
+    timestamp_ns: 1774176381782655011
+    duration_ns: 11458272
+    watcher_kernel_id: 20
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/2951397397442650743/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 6
+    timestamp_ns: 1774176381782678465
+    duration_ns: 11481726
+    watcher_kernel_id: 7
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/5760425245479037351/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 6
+    timestamp_ns: 1774176381782690989
+    duration_ns: 11494250
+    watcher_kernel_id: 16
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/2262183613333943417/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 6
+    timestamp_ns: 1774176381783229570
+    duration_ns: 12032831
+    watcher_kernel_id: 3
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/14430872977760284008/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_kernel_compile_finished:
+    id: 6
+    timestamp_ns: 1774176381783242996
+    duration_ns: 12046257
+    watcher_kernel_id: 11
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/14666156515712486587/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+- program_compile_finished:
+    id: 4
+    timestamp_ns: 1774176381783628133
+    duration_ns: 12377090
+- program_compile_finished:
+    id: 6
+    timestamp_ns: 1774176381785470109
+    duration_ns: 14273370
+- program_created:
+    id: 8
+    timestamp_ns: 1774176381787535061
+- program_created:
+    id: 9
+    timestamp_ns: 1774176381787558436
+- program_created:
+    id: 10
+    timestamp_ns: 1774176381787562454
+- program_created:
+    id: 11
+    timestamp_ns: 1774176381787570028
+- program_compile_started:
+    id: 11
+    timestamp_ns: 1774176381788346424
+- program_compile_started:
+    id: 10
+    timestamp_ns: 1774176381788348598
+- program_compile_started:
+    id: 9
+    timestamp_ns: 1774176381788354810
+- program_compile_started:
+    id: 8
+    timestamp_ns: 1774176381788360832
+- program_kernel_compile_finished:
+    id: 11
+    timestamp_ns: 1774176381789822299
+    duration_ns: 1475875
+    watcher_kernel_id: 44
+    name: cq_dispatch_subordinate
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch_subordinate/8261962475252462679/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+- program_kernel_compile_finished:
+    id: 9
+    timestamp_ns: 1774176381789830665
+    duration_ns: 1475855
+    watcher_kernel_id: 38
+    name: cq_dispatch_subordinate
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch_subordinate/8261962475252462679/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+- program_kernel_compile_finished:
+    id: 8
+    timestamp_ns: 1774176381789837007
+    duration_ns: 1476175
+    watcher_kernel_id: 35
+    name: cq_dispatch_subordinate
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch_subordinate/8261962475252462679/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+- program_kernel_compile_finished:
+    id: 10
+    timestamp_ns: 1774176381789843790
+    duration_ns: 1495192
+    watcher_kernel_id: 41
+    name: cq_dispatch_subordinate
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch_subordinate/8261962475252462679/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+- program_kernel_compile_finished:
+    id: 11
+    timestamp_ns: 1774176381790217966
+    duration_ns: 1871542
+    watcher_kernel_id: 43
+    name: cq_dispatch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch/10898400269223687608/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+- program_kernel_compile_finished:
+    id: 10
+    timestamp_ns: 1774176381790231903
+    duration_ns: 1883305
+    watcher_kernel_id: 40
+    name: cq_dispatch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch/10898400269223687608/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+- program_kernel_compile_finished:
+    id: 8
+    timestamp_ns: 1774176381790237003
+    duration_ns: 1876171
+    watcher_kernel_id: 34
+    name: cq_dispatch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch/10898400269223687608/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+- program_kernel_compile_finished:
+    id: 9
+    timestamp_ns: 1774176381790242824
+    duration_ns: 1888014
+    watcher_kernel_id: 37
+    name: cq_dispatch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch/10898400269223687608/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+- program_kernel_compile_finished:
+    id: 11
+    timestamp_ns: 1774176381790245930
+    duration_ns: 1899506
+    watcher_kernel_id: 42
+    name: cq_prefetch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_prefetch/13050502321341158571/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+- program_kernel_compile_finished:
+    id: 10
+    timestamp_ns: 1774176381790252172
+    duration_ns: 1903574
+    watcher_kernel_id: 39
+    name: cq_prefetch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_prefetch/13050502321341158571/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+- program_kernel_compile_finished:
+    id: 8
+    timestamp_ns: 1774176381790256510
+    duration_ns: 1895678
+    watcher_kernel_id: 33
+    name: cq_prefetch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_prefetch/13050502321341158571/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+- program_kernel_compile_finished:
+    id: 9
+    timestamp_ns: 1774176381790262371
+    duration_ns: 1907561
+    watcher_kernel_id: 36
+    name: cq_prefetch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_prefetch/13050502321341158571/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+- program_compile_finished:
+    id: 11
+    timestamp_ns: 1774176381791387936
+    duration_ns: 3041512
+- program_compile_finished:
+    id: 8
+    timestamp_ns: 1774176381791392134
+    duration_ns: 3031302
+- program_compile_finished:
+    id: 10
+    timestamp_ns: 1774176381791396953
+    duration_ns: 3048355
+- program_compile_finished:
+    id: 9
+    timestamp_ns: 1774176381791400670
+    duration_ns: 3045860
+- program_destroyed:
+    id: 8
+    timestamp_ns: 1774176384206434689
+- program_destroyed:
+    id: 9
+    timestamp_ns: 1774176384206610605
+- program_destroyed:
+    id: 10
+    timestamp_ns: 1774176384206729433
+- program_destroyed:
+    id: 11
+    timestamp_ns: 1774176384206836668

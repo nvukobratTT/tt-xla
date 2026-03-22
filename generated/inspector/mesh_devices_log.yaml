@@ -1,0 +1,23 @@
+- mesh_device_created:
+    mesh_id: 1
+    timestamp_ns: 1774176584591737363
+    devices: [3, 2, 1, 0]
+    shape: [4, 1]
+- mesh_device_initialized:
+    mesh_id: 1
+    timestamp_ns: 1774176584592039230
+- mesh_device_created:
+    mesh_id: 2
+    timestamp_ns: 1774176594625188236
+    parent_mesh_id: 1
+    devices: [3, 2, 1, 0]
+    shape: [4, 1]
+- mesh_device_initialized:
+    mesh_id: 2
+    timestamp_ns: 1774176594625881473
+- mesh_device_destroyed:
+    mesh_id: 2
+    timestamp_ns: 1774176668911226077
+- mesh_device_destroyed:
+    mesh_id: 1
+    timestamp_ns: 1774176672546620308

@@ -1,0 +1,264 @@
+- kernel:
+    watcher_kernel_id: 18
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/11318144607776535940/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 32
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/15952600875368568023/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 4
+- kernel:
+    watcher_kernel_id: 31
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/12680008585778388939/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 6
+- kernel:
+    watcher_kernel_id: 19
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/9270442628980300511/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 13
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/1931154385533966251/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 23
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/12771110966090167769/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 24
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/6400072283801524350/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 14
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/5689169619052613162/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 9
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/15297551045637746005/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 15
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/10129978892172930710/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 5
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/17899143957790546581/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 30
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/16184017440458153619/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 27
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/2833192098568114765/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 22
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/4142539638778957652/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 1
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/7845393496514354698/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 29
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/3798939963124536729/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 4
+- kernel:
+    watcher_kernel_id: 10
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/10025964194113368596/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 6
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/12313201369233760909/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 4
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/4349398854380702306/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 26
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/6932944151346237009/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 4
+- kernel:
+    watcher_kernel_id: 28
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/14893553203121362205/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 6
+- kernel:
+    watcher_kernel_id: 25
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/12477022948991197609/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 6
+- kernel:
+    watcher_kernel_id: 2
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/16139166888850161212/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 4
+- kernel:
+    watcher_kernel_id: 8
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/9162572702629841315/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 4
+- kernel:
+    watcher_kernel_id: 12
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/13162160896215282506/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 4
+- kernel:
+    watcher_kernel_id: 17
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/7143200437841305288/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 4
+- kernel:
+    watcher_kernel_id: 21
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/4780116890538333623/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 4
+- kernel:
+    watcher_kernel_id: 20
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/2951397397442650743/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 6
+- kernel:
+    watcher_kernel_id: 7
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/5760425245479037351/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 6
+- kernel:
+    watcher_kernel_id: 16
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/2262183613333943417/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 6
+- kernel:
+    watcher_kernel_id: 3
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/14430872977760284008/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 6
+- kernel:
+    watcher_kernel_id: 11
+    name: fabric_erisc_router
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/fabric_erisc_router/14666156515712486587/
+    source: tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+    program_id: 6
+- kernel:
+    watcher_kernel_id: 44
+    name: cq_dispatch_subordinate
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch_subordinate/8261962475252462679/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 38
+    name: cq_dispatch_subordinate
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch_subordinate/8261962475252462679/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+    program_id: 9
+- kernel:
+    watcher_kernel_id: 35
+    name: cq_dispatch_subordinate
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch_subordinate/8261962475252462679/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+    program_id: 8
+- kernel:
+    watcher_kernel_id: 41
+    name: cq_dispatch_subordinate
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch_subordinate/8261962475252462679/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+    program_id: 10
+- kernel:
+    watcher_kernel_id: 43
+    name: cq_dispatch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch/10898400269223687608/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 40
+    name: cq_dispatch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch/10898400269223687608/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+    program_id: 10
+- kernel:
+    watcher_kernel_id: 34
+    name: cq_dispatch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch/10898400269223687608/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+    program_id: 8
+- kernel:
+    watcher_kernel_id: 37
+    name: cq_dispatch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_dispatch/10898400269223687608/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+    program_id: 9
+- kernel:
+    watcher_kernel_id: 42
+    name: cq_prefetch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_prefetch/13050502321341158571/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 39
+    name: cq_prefetch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_prefetch/13050502321341158571/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+    program_id: 10
+- kernel:
+    watcher_kernel_id: 33
+    name: cq_prefetch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_prefetch/13050502321341158571/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+    program_id: 8
+- kernel:
+    watcher_kernel_id: 36
+    name: cq_prefetch
+    path: /root/.cache/tt-metal-cache/2175777791293737106/kernels/cq_prefetch/13050502321341158571/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+    program_id: 9
