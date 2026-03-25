@@ -4,10 +4,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Mochi DiT compile example — torch.compile(backend="tt", fullgraph=True).
+Mochi DiT compile example — torch.compile(backend="tt", fullgraph=True) with
+4-chip tensor parallelism via XLA SPMD.
 
 Loads the 10B MochiTransformer3DModel, applies patches for single-graph
-compilation, and runs at 480p/5s resolution.
+compilation, shards weights across devices, and runs at 480p/5s resolution.
 
 Usage:
     # Compile-only (no device execution)
@@ -21,12 +22,16 @@ Usage:
 """
 
 import argparse
+import os
 import time
 import types
 
+import numpy as np
 import torch
 import torch_xla
+import torch_xla.distributed.spmd as xs
 import torch_xla.runtime as xr
+from torch_xla.distributed.spmd import Mesh
 
 
 # =============================================================================
@@ -98,32 +103,117 @@ def patch_rope_autocast(model):
 
 
 # =============================================================================
+# TENSOR PARALLELISM — Megatron-style sharding for Mochi DiT
+#
+# Column-parallel: Q/K/V projections, FFN up/gate (split output dim across devices)
+# Row-parallel: output projections, FFN down (split input dim, all-reduce after)
+# =============================================================================
+
+
+def apply_tp_sharding(model, mesh):
+    """
+    Apply Megatron-style tensor parallel sharding to MochiTransformer3DModel.
+
+    Shards all 48 transformer blocks using the same strategy as mochi_t2v_tp.py:
+    - Attention Q/K/V: column-parallel (split heads across devices)
+    - Attention output: row-parallel (partial results, all-reduce)
+    - FFN up/gate: column-parallel
+    - FFN down: row-parallel
+
+    Both video and context streams are sharded identically.
+    """
+    shard_specs = {}
+
+    for i, block in enumerate(model.transformer_blocks):
+        # --- Joint Attention (attn1) ---
+        # Video stream Q/K/V — column-parallel
+        shard_specs[block.attn1.to_q.weight] = ("model", None)
+        shard_specs[block.attn1.to_k.weight] = ("model", None)
+        shard_specs[block.attn1.to_v.weight] = ("model", None)
+
+        # Context stream Q/K/V — column-parallel
+        if hasattr(block.attn1, 'add_q_proj') and block.attn1.add_q_proj is not None:
+            shard_specs[block.attn1.add_q_proj.weight] = ("model", None)
+        if hasattr(block.attn1, 'add_k_proj') and block.attn1.add_k_proj is not None:
+            shard_specs[block.attn1.add_k_proj.weight] = ("model", None)
+        if hasattr(block.attn1, 'add_v_proj') and block.attn1.add_v_proj is not None:
+            shard_specs[block.attn1.add_v_proj.weight] = ("model", None)
+
+        # Output projection — row-parallel
+        shard_specs[block.attn1.to_out[0].weight] = (None, "model")
+        if block.attn1.to_out[0].bias is not None:
+            shard_specs[block.attn1.to_out[0].bias] = (None,)
+
+        # Context output projection (all blocks except last)
+        if hasattr(block.attn1, 'to_add_out') and block.attn1.to_add_out is not None:
+            shard_specs[block.attn1.to_add_out.weight] = (None, "model")
+            if block.attn1.to_add_out.bias is not None:
+                shard_specs[block.attn1.to_add_out.bias] = (None,)
+
+        # --- Video FFN (SwiGLU) ---
+        shard_specs[block.ff.net[0].proj.weight] = ("model", None)  # up — column-parallel
+        if hasattr(block.ff.net[0].proj, 'bias') and block.ff.net[0].proj.bias is not None:
+            shard_specs[block.ff.net[0].proj.bias] = ("model",)
+        shard_specs[block.ff.net[2].weight] = (None, "model")  # down — row-parallel
+        if hasattr(block.ff.net[2], 'bias') and block.ff.net[2].bias is not None:
+            shard_specs[block.ff.net[2].bias] = (None,)
+
+        # --- Context FFN (all blocks except last) ---
+        if block.ff_context is not None:
+            shard_specs[block.ff_context.net[0].proj.weight] = ("model", None)
+            if hasattr(block.ff_context.net[0].proj, 'bias') and block.ff_context.net[0].proj.bias is not None:
+                shard_specs[block.ff_context.net[0].proj.bias] = ("model",)
+            shard_specs[block.ff_context.net[2].weight] = (None, "model")
+            if hasattr(block.ff_context.net[2], 'bias') and block.ff_context.net[2].bias is not None:
+                shard_specs[block.ff_context.net[2].bias] = (None,)
+
+    for tensor, spec in shard_specs.items():
+        xs.mark_sharding(tensor, mesh, spec)
+
+    print(f"  Applied TP sharding: {len(model.transformer_blocks)} blocks, {len(shard_specs)} tensors")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Mochi DiT compile")
+    parser = argparse.ArgumentParser(description="Mochi DiT compile with TP")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=848)
     parser.add_argument("--num-frames", type=int, default=121,
                         help="(n-1) must be divisible by 6. 121 = 5s at 24fps")
-    parser.add_argument("--optimization-level", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--optimization-level", type=int, default=1, choices=[0, 1, 2])
     parser.add_argument("--compile-only", action="store_true",
                         help="Only compile, skip forward execution")
     args = parser.parse_args()
 
     assert (args.num_frames - 1) % 6 == 0, f"(num_frames-1) must be divisible by 6"
 
-    # --- Device setup ---
+    # --- SPMD + Device setup ---
+    os.environ["CONVERT_SHLO_TO_SHARDY"] = "1"
     xr.set_device_type("TT")
+    xr.use_spmd()
+
+    num_devices = xr.global_runtime_device_count()
+    print(f"SPMD enabled: {num_devices} devices")
+
     torch_xla.set_custom_compile_options({
         "optimization_level": args.optimization_level,
     })
     device = torch_xla.device()
 
+    # Create mesh for tensor parallelism
+    mesh = Mesh(
+        np.array(range(num_devices)),
+        (1, num_devices),
+        ("batch", "model"),
+    )
+    print(f"Mesh: {mesh.mesh_shape} ({num_devices}-way TP)")
+
     # --- Apply patches for single-graph compilation ---
-    print("Applying patches for fullgraph compilation:")
+    print("\nApplying patches for fullgraph compilation:")
     patch_unflatten_for_dynamo()
 
     # --- Load model ---
@@ -140,10 +230,15 @@ def main():
     patch_rope_autocast(model)
 
     model = model.to(device)
-    print(f"Loaded + moved to XLA in {time.time() - t0:.1f}s", flush=True)
+
+    # --- Apply tensor parallel sharding ---
+    print("\nApplying tensor parallel sharding:")
+    apply_tp_sharding(model, mesh)
+
+    print(f"Loaded + sharded + moved to XLA in {time.time() - t0:.1f}s", flush=True)
 
     # --- Compile (single graph) ---
-    print("\ntorch.compile(backend='tt', fullgraph=True)...", flush=True)
+    print(f"\ntorch.compile(backend='tt', fullgraph=True)...", flush=True)
     compiled = torch.compile(model, backend="tt", fullgraph=True)
 
     # --- Prepare inputs ---
@@ -154,6 +249,7 @@ def main():
     print(f"\nConfig: {h}x{w}, {nf} frames ({(nf-1)/24:.1f}s at 24fps)")
     print(f"  Latent: [1, 12, {latent_frames}, {h//8}, {w//8}]")
     print(f"  Text:   [1, {text_len}, 4096]")
+    print(f"  TP:     {num_devices}-way, opt_level={args.optimization_level}")
 
     hidden_states = torch.randn(
         1, 12, latent_frames, h // 8, w // 8,
