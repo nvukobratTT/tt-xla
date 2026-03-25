@@ -28,6 +28,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch_xla
 import torch_xla.distributed.spmd as xs
 import torch_xla.runtime as xr
@@ -95,6 +96,47 @@ def patch_rope_autocast(model):
     print("  [PATCH 3] _create_rope → removed autocast")
 
 
+def patch_swiglu_for_tp(model):
+    """
+    PATCH 4: Split GEGLU fused proj into separate gate+up for correct TP sharding.
+
+    Problem: SwiGLU uses a single Linear(in, 2*hidden) and splits output via chunk(2, -1).
+    With column-parallel TP on dim 0, slice indices on the sharded output don't correspond
+    to the global gate/up boundary — each chip gets mixed gate+up rows.
+
+    Fix: Pre-split into separate gate_proj and up_proj, each independently sharded.
+    """
+    import torch.nn.functional as F
+
+    count = 0
+    for block in model.transformer_blocks:
+        for ff in [block.ff, block.ff_context]:
+            if ff is None:
+                continue
+            geglu = ff.net[0]
+            if not hasattr(geglu, 'proj'):
+                continue
+
+            W = geglu.proj.weight  # [2*hidden, in_features]
+            half = W.shape[0] // 2
+
+            # SwiGLU.forward: chunk(2,-1) -> [up, gate]; return up * silu(gate)
+            # First half = up (no activation), second half = gate (gets silu)
+            geglu.up_proj = nn.Linear(W.shape[1], half, bias=False, dtype=W.dtype)
+            geglu.gate_proj = nn.Linear(W.shape[1], half, bias=False, dtype=W.dtype)
+            geglu.up_proj.weight = nn.Parameter(W[:half].clone())
+            geglu.gate_proj.weight = nn.Parameter(W[half:].clone())
+            del geglu.proj
+
+            def _swiglu_forward(self, x):
+                return self.up_proj(x) * F.silu(self.gate_proj(x))
+            geglu.forward = types.MethodType(_swiglu_forward, geglu)
+            count += 1
+
+    print(f"  [PATCH 4] {count} SwiGLU split (fused proj → gate_proj + up_proj)")
+    return count
+
+
 # =============================================================================
 # TENSOR PARALLELISM
 # =============================================================================
@@ -127,21 +169,19 @@ def apply_tp_sharding(model, mesh):
             if block.attn1.to_add_out.bias is not None:
                 shard_specs[block.attn1.to_add_out.bias] = (None,)
 
-        # FFN — column/row parallel
-        shard_specs[block.ff.net[0].proj.weight] = ("model", None)
-        if hasattr(block.ff.net[0].proj, 'bias') and block.ff.net[0].proj.bias is not None:
-            shard_specs[block.ff.net[0].proj.bias] = ("model",)
-        shard_specs[block.ff.net[2].weight] = (None, "model")
-        if hasattr(block.ff.net[2], 'bias') and block.ff.net[2].bias is not None:
-            shard_specs[block.ff.net[2].bias] = (None,)
-
-        if block.ff_context is not None:
-            shard_specs[block.ff_context.net[0].proj.weight] = ("model", None)
-            if hasattr(block.ff_context.net[0].proj, 'bias') and block.ff_context.net[0].proj.bias is not None:
-                shard_specs[block.ff_context.net[0].proj.bias] = ("model",)
-            shard_specs[block.ff_context.net[2].weight] = (None, "model")
-            if hasattr(block.ff_context.net[2], 'bias') and block.ff_context.net[2].bias is not None:
-                shard_specs[block.ff_context.net[2].bias] = (None,)
+        # FFN — column/row parallel (split gate+up from PATCH 4)
+        for ff in [block.ff, block.ff_context]:
+            if ff is None:
+                continue
+            geglu = ff.net[0]
+            if hasattr(geglu, 'gate_proj'):
+                shard_specs[geglu.gate_proj.weight] = ("model", None)
+                shard_specs[geglu.up_proj.weight] = ("model", None)
+            elif hasattr(geglu, 'proj'):
+                shard_specs[geglu.proj.weight] = ("model", None)
+            shard_specs[ff.net[2].weight] = (None, "model")
+            if hasattr(ff.net[2], 'bias') and ff.net[2].bias is not None:
+                shard_specs[ff.net[2].bias] = (None,)
 
     for tensor, spec in shard_specs.items():
         xs.mark_sharding(tensor, mesh, spec)
@@ -224,6 +264,7 @@ class MochiCompilePipeline:
 
         patch_attention_processors(self.transformer)
         patch_rope_autocast(self.transformer)
+        patch_swiglu_for_tp(self.transformer)
 
         self.transformer = self.transformer.to(self.device)
 
