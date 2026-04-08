@@ -61,4 +61,54 @@ SerializedExecutableInstance::SerializedExecutableInstance(
   assert(data_ptr == m_payload.data() + m_payload.size());
 }
 
+bool SerializedExecutableInstance::deserialize(
+    const char *data, size_t size, std::string &ttir_code,
+    std::string &ttnn_code, std::vector<std::byte> &flatbuffer_data) {
+  const size_t header_size = sizeof(SerializationHeader);
+  if (size < header_size) {
+    LOG_F(ERROR, "DeserializeAndLoad: payload too small (%zu bytes, need %zu)",
+          size, header_size);
+    return false;
+  }
+
+  const SerializationHeader *header =
+      reinterpret_cast<const SerializationHeader *>(data);
+
+  if (std::memcmp(header->magic, "TTSERv00", 8) != 0) {
+    LOG_F(ERROR, "DeserializeAndLoad: invalid magic string");
+    return false;
+  }
+
+  const char *body = data + header_size;
+  const size_t body_size = size - header_size;
+
+  // Validate all section bounds before accessing memory.
+  if (header->ttir_size > 0 &&
+      header->ttir_offset + header->ttir_size > body_size) {
+    LOG_F(ERROR, "DeserializeAndLoad: TTIR section out of bounds");
+    return false;
+  }
+  if (header->ttnn_size > 0 &&
+      header->ttnn_offset + header->ttnn_size > body_size) {
+    LOG_F(ERROR, "DeserializeAndLoad: TTNN section out of bounds");
+    return false;
+  }
+  if (header->fb_size > 0 &&
+      header->fb_offset + header->fb_size > body_size) {
+    LOG_F(ERROR, "DeserializeAndLoad: flatbuffer section out of bounds");
+    return false;
+  }
+
+  ttir_code.assign(body + header->ttir_offset, header->ttir_size);
+  ttnn_code.assign(body + header->ttnn_offset, header->ttnn_size);
+
+  flatbuffer_data.resize(header->fb_size);
+  if (header->fb_size > 0) {
+    std::memcpy(flatbuffer_data.data(), body + header->fb_offset,
+                header->fb_size);
+  }
+
+  return true;
+}
+
 } // namespace tt::pjrt

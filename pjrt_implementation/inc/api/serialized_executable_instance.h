@@ -77,6 +77,15 @@ public:
   static std::unique_ptr<SerializedExecutableInstance>
   createInstance(const ExecutableImage *executable_image);
 
+  // Deserializes the payload produced by Serialize.
+  // On success, returns true and populates ttir_code, ttnn_code, and
+  // flatbuffer_data with their respective sections from the TTSERv00 payload.
+  // Returns false if the payload is too small, has an invalid magic string,
+  // or any section bounds are out of range.
+  static bool deserialize(const char *data, size_t size,
+                          std::string &ttir_code, std::string &ttnn_code,
+                          std::vector<std::byte> &flatbuffer_data);
+
   // Casts this serialized executable instance to PJRT_SerializedExecutable
   // pointer.
   operator PJRT_SerializedExecutable *() {

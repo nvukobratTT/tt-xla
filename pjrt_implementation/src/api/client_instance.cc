@@ -31,9 +31,12 @@
 #include "api/executable_image.h"
 #include "api/memory_instance.h"
 #include "api/module_builder/module_builder.h"
+#include "api/serialized_executable_instance.h"
 #include "api/tensor_pool.h"
+#include "utils/data_type_utils.h"
 #include "utils/logging.h"
 #include "utils/utils.h"
+#include "ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h"
 
 namespace tt::pjrt {
 
@@ -321,6 +324,7 @@ void ClientInstance::bindApi(PJRT_Api *api) {
   api->PJRT_Client_Compile = internal::onClientCompile;
   api->PJRT_Client_DefaultDeviceAssignment =
       internal::onClientDefaultDeviceAssignment;
+  api->PJRT_Executable_DeserializeAndLoad = internal::onDeserializeAndLoad;
   api->PJRT_Client_BufferFromHostBuffer = internal::onBufferFromHostBuffer;
 }
 
@@ -908,6 +912,159 @@ onBufferFromHostBuffer(PJRT_Client_BufferFromHostBuffer_Args *args) {
   // Releasing the ownership to the PJRT API caller since the caller is
   // responsible for calling `PJRT_Buffer_Destroy` on the buffer.
   args->buffer = *buffer.release();
+
+  return nullptr;
+}
+
+
+PJRT_Error *
+onDeserializeAndLoad(PJRT_Executable_DeserializeAndLoad_Args *args) {
+  ZoneScoped;
+  DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Executable_DeserializeAndLoad");
+
+  // Step 1: Parse the TTSERv00 payload
+  std::string ttir_mlir;
+  std::string ttnn_mlir;
+  std::vector<std::byte> flatbuffer_data;
+
+  bool ok = SerializedExecutableInstance::deserialize(
+      args->serialized_executable, args->serialized_executable_size,
+      ttir_mlir, ttnn_mlir, flatbuffer_data);
+
+  if (!ok || flatbuffer_data.empty()) {
+    LOG_F(ERROR, "DeserializeAndLoad: invalid or incomplete TTSERv00 payload "
+                 "(size=%zu)", args->serialized_executable_size);
+    return *ErrorInstance::makeError(tt_pjrt_status::kInvalidArgument)
+                .release();
+  }
+
+  // Step 2: Load the pre-compiled flatbuffer binary from memory
+  tt::runtime::Binary binary = tt::runtime::Flatbuffer::loadFromMemory(
+      flatbuffer_data.data(), flatbuffer_data.size());
+
+  if (binary.handle == nullptr) {
+    LOG_F(ERROR, "DeserializeAndLoad: failed to load flatbuffer from memory");
+    return *ErrorInstance::makeError(tt_pjrt_status::kInternal).release();
+  }
+
+  // Step 3: Extract I/O metadata from the flatbuffer binary
+  const uint32_t program_index = 0;
+  std::vector<tt::runtime::TensorDesc> input_descs =
+      binary.getProgramInputs(program_index);
+  std::vector<tt::runtime::TensorDesc> output_descs =
+      binary.getProgramOutputs(program_index);
+  const size_t num_inputs = input_descs.size();
+  const size_t num_outputs = output_descs.size();
+
+  std::vector<std::vector<std::uint32_t>> output_dimensions;
+  std::vector<size_t> output_ranks;
+  std::vector<std::int64_t> output_dimensions_flat;
+  std::vector<PJRT_Buffer_Type> output_types;
+
+  output_dimensions.reserve(num_outputs);
+  output_ranks.reserve(num_outputs);
+  output_types.reserve(num_outputs);
+
+  for (const tt::runtime::TensorDesc &desc : output_descs) {
+    output_dimensions.push_back(desc.shape);
+    output_ranks.push_back(desc.shape.size());
+    for (uint32_t dim : desc.shape) {
+      output_dimensions_flat.push_back(static_cast<std::int64_t>(dim));
+    }
+    output_types.push_back(
+        data_type_utils::convertRuntimeToPJRTDataType(desc.dataType));
+  }
+
+  auto [mesh_rows, mesh_cols] = binary.getProgramMeshShape(program_index);
+  std::vector<std::uint32_t> mesh_shape = {mesh_rows, mesh_cols};
+  const size_t num_devices_to_utilize =
+      static_cast<size_t>(mesh_rows) * static_cast<size_t>(mesh_cols);
+  const size_t num_partitions = num_devices_to_utilize;
+  const size_t num_replicas = 1;
+
+  // Step 4: Build Identity shardings for all I/O
+  // Identity sharding = fully replicated. Correct for non-SPMD models and for
+  // SPMD models where XLA-visible tensors are replicated (torch_xla TP models).
+  auto make_identity_sharding =
+      []() -> mlir::tt::sharding_utils::MeshSharding {
+    return mlir::tt::sharding_utils::MeshSharding(
+        mlir::tt::ttcore::MeshShardDirection::FullToShard,
+        mlir::tt::ttcore::MeshShardType::Identity,
+        llvm::SmallVector<int64_t>{},
+        llvm::SmallVector<int64_t>{},
+        llvm::SmallVector<int64_t>{},
+        llvm::SmallVector<int64_t>{},
+        mlir::tt::ttcore::ShardStatus::Unsharded);
+  };
+
+  std::vector<mlir::tt::sharding_utils::MeshSharding> input_shardings(
+      num_inputs, make_identity_sharding());
+  std::vector<mlir::tt::sharding_utils::MeshSharding> output_shardings(
+      num_outputs, make_identity_sharding());
+
+  // Output memory kinds: device memory for all outputs.
+  std::vector<const char *> output_memory_kinds;
+  std::vector<size_t> output_memory_kinds_sizes;
+  output_memory_kinds.reserve(num_outputs);
+  output_memory_kinds_sizes.reserve(num_outputs);
+  for (size_t i = 0; i < num_outputs; ++i) {
+    output_memory_kinds.push_back(
+        MemoryInstance::c_device_memory_kind_name.c_str());
+    output_memory_kinds_sizes.push_back(
+        MemoryInstance::c_device_memory_kind_name.size());
+  }
+
+  CompileOptions compile_options;
+  compile_options.backend = BackendRuntime::TTNNFlatbuffer;
+
+  // Step 5: Create FlatbufferExecutableImage
+  auto executable_image = FlatbufferExecutableImage::createInstance(
+      binary,
+      /*original_mlir_code=*/"",
+      std::move(ttir_mlir),
+      std::move(ttnn_mlir),
+      /*executable_name=*/"tt_deserialized_executable",
+      num_inputs,
+      num_outputs,
+      std::move(output_dimensions),
+      std::move(output_ranks),
+      std::move(output_dimensions_flat),
+      num_partitions,
+      num_replicas,
+      num_devices_to_utilize,
+      mesh_shape,
+      input_shardings,
+      output_shardings,
+      output_types,
+      std::move(output_memory_kinds),
+      std::move(output_memory_kinds_sizes),
+      /*optimized_mlir_code=*/"",
+      std::move(compile_options));
+
+  // Step 6: Create LoadedExecutableInstance
+  ClientInstance *client = ClientInstance::unwrap(args->client);
+  const std::vector<DeviceInstance *> &all_devices =
+      client->getAddressableDevicesRaw();
+
+  if (num_devices_to_utilize > all_devices.size()) {
+    LOG_F(ERROR,
+          "DeserializeAndLoad: binary requires %zu devices but only %zu "
+          "addressable",
+          num_devices_to_utilize, all_devices.size());
+    return *ErrorInstance::makeError(tt_pjrt_status::kInvalidArgument)
+                .release();
+  }
+
+  std::vector<DeviceInstance *> addressable_devices(
+      all_devices.begin(),
+      all_devices.begin() + static_cast<ptrdiff_t>(num_devices_to_utilize));
+
+  std::unique_ptr<LoadedExecutableInstance> loaded =
+      executable_image->toExecutableInstance(std::move(addressable_devices),
+                                             client);
+
+  args->loaded_executable =
+      reinterpret_cast<PJRT_LoadedExecutable *>(loaded.release());
 
   return nullptr;
 }
