@@ -1,7 +1,7 @@
 From 73c27b47e6785a087c4cf0b01c2e16d279e13dd9 Mon Sep 17 00:00:00 2001
 From: nvukobratTT <nvukobratTT@users.noreply.github.com>
 Date: Wed, 8 Apr 2026 23:50:59 +0000
-Subject: [PATCH 3/8] =?UTF-8?q?fix(StableHLO=E2=86=92TTIR):=20fix=20PadOp?=
+Subject: [PATCH 2/9] =?UTF-8?q?fix(StableHLO=E2=86=92TTIR):=20fix=20PadOp?=
  =?UTF-8?q?=20interior-padding=20index=20order=20(row-major)?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

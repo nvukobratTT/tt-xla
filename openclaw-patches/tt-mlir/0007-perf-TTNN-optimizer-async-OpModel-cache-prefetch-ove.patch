@@ -1,7 +1,7 @@
 From 629ed0de97fd82ef3b157639a44f589af17caafa Mon Sep 17 00:00:00 2001
 From: nvukobratTT <nvukobratTT@users.noreply.github.com>
 Date: Thu, 9 Apr 2026 01:18:31 +0000
-Subject: [PATCH 8/8] perf(TTNN optimizer): async OpModel cache prefetch
+Subject: [PATCH 7/9] perf(TTNN optimizer): async OpModel cache prefetch
  (overlap DFSharding + cache warm)
 
 Add infrastructure for overlapping block N DFShardingPolicy (CPU-only)

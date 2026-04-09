@@ -1,7 +1,7 @@
 From 64021a52dba117d56401d5cd740eaa457e9c1fc1 Mon Sep 17 00:00:00 2001
 From: nvukobratTT <nvukobratTT@users.noreply.github.com>
 Date: Thu, 9 Apr 2026 00:33:17 +0000
-Subject: [PATCH 6/8] fix(TTNN): exclude SDPA ops from LegalOpLayoutAnalysis
+Subject: [PATCH 5/9] fix(TTNN): exclude SDPA ops from LegalOpLayoutAnalysis
  optimizer target
 
 ScaledDotProductAttention kernels control their output memory layout

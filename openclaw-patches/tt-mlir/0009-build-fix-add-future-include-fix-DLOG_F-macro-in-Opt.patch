@@ -1,0 +1,40 @@
+From f2d7740675e8e54156473b6b4ece04e92384446c Mon Sep 17 00:00:00 2001
+From: nvukobratTT <nvukobratTT@users.noreply.github.com>
+Date: Thu, 9 Apr 2026 04:46:10 +0000
+Subject: [PATCH 9/9] build-fix: add <future> include + fix DLOG_F macro in
+ Optimizer.cpp
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fix two compilation errors introduced by async OpModel prefetch (commit 629ed0de9):
+1. std::future not found → add #include <future>
+2. DLOG_F(LOG_DEBUG, ...) not a ttmlir macro → replace with TTMLIR_DEBUG(ttmlir::LogComponent::Optimizer, ...)
+---
+ lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
+index 2acb0a5eb..0d9107eb4 100644
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
+@@ -46,6 +46,7 @@
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/Error.h"
+ #include "llvm/Support/ErrorHandling.h"
++#include <future>
+ 
+ 
+ // Compute a structural fingerprint for an op to detect structurally-identical
+@@ -521,7 +522,7 @@ public:
+       });
+     });
+ 
+-    DLOG_F(LOG_DEBUG, "TTNNOptimizer legalConfigCache: %zu hits / %zu misses",
++    TTMLIR_DEBUG(ttmlir::LogComponent::Optimizer, "TTNNOptimizer legalConfigCache: %zu hits / %zu misses",
+            legalConfigCacheHits, legalConfigCacheMisses);
+ 
+     llvm::DenseMap<func::FuncOp, llvm::SmallVector<Operation *>> opSchedule;
+-- 
+2.34.1
+

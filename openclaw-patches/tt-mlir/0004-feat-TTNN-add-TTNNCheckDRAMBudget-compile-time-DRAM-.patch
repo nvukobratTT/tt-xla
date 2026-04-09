@@ -1,7 +1,7 @@
 From 2ac6b6ae820109ad7f2080abce3788f3ac4302b2 Mon Sep 17 00:00:00 2001
 From: nvukobratTT <nvukobratTT@users.noreply.github.com>
 Date: Thu, 9 Apr 2026 00:19:14 +0000
-Subject: [PATCH 5/8] feat(TTNN): add TTNNCheckDRAMBudget compile-time DRAM OOM
+Subject: [PATCH 4/9] feat(TTNN): add TTNNCheckDRAMBudget compile-time DRAM OOM
  detection pass
 
 Adds a new MLIR pass ttnn-check-dram-budget that runs after ttnn-deallocate

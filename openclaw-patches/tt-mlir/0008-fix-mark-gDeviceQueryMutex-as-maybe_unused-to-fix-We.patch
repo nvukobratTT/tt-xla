@@ -1,0 +1,30 @@
+From 784541429413a4dbe636a01f5cd0be9ad4158ccf Mon Sep 17 00:00:00 2001
+From: nvukobratTT <nvukobratTT@users.noreply.github.com>
+Date: Thu, 9 Apr 2026 04:38:28 +0000
+Subject: [PATCH 8/9] fix: mark gDeviceQueryMutex as maybe_unused to fix
+ -Werror build
+
+The async prefetch patch (commit 629ed0de9) declared gDeviceQueryMutex
+for future use by background prefetch threads, but the lock is not yet
+acquired anywhere (the full async implementation is pending). Mark it
+[[maybe_unused]] to suppress the -Werror,-Wunused-variable build error.
+---
+ lib/OpModel/TTNN/TTNNOpModel.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+index 1e13f1ffb..1a5003a53 100644
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -61,7 +61,7 @@ struct ProgramCacheState {
+ // The TT device context is not thread-safe; concurrent queries from separate
+ // threads must be serialized with this mutex. The main optimizer thread owns
+ // the single-threaded path; background prefetch threads acquire this lock.
+-static std::mutex gDeviceQueryMutex;
++[[maybe_unused]] static std::mutex gDeviceQueryMutex;
+ 
+ // Spec describing one op to pre-warm in the OpModel constraints cache.
+ struct OpPrefetchSpec {
+-- 
+2.34.1
+
