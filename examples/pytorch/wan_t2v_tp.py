@@ -60,6 +60,147 @@ def export_to_video(frames: np.ndarray, output_path: str, fps: int = 16):
     )
 
 
+
+
+# =============================================================================
+# TT SDPA Attention Processor — enables SDPA fusion in tt-mlir
+# =============================================================================
+
+def _compute_seq_len(height: int, width: int, num_frames: int) -> int:
+    """Compute transformer sequence length for given resolution + frame count."""
+    frames = (num_frames - 1) // 4 + 1
+    h_patches = height // 16
+    w_patches = width // 16
+    return frames * h_patches * w_patches
+
+
+def is_sdpa_compatible(height: int, width: int, num_frames: int) -> bool:
+    """Return True if seq_len is divisible by 32 (required by tt.scaled_dot_product_attention)."""
+    return _compute_seq_len(height, width, num_frames) % 32 == 0
+
+
+class WanTTSDPAAttnProcessor:
+    """
+    TT-native attention processor for WanTransformerBlock.
+
+    Replaces diffusers WanAttnProcessor to emit a stablehlo.CustomCall
+    "tt.scaled_dot_product_attention" instead of decomposed matmul+softmax+matmul.
+    tt-mlir fuses this into a single SDPA kernel (O(seq) memory vs O(seq^2)),
+    breaking the sequence-length scaling barrier for high-resolution video.
+
+    Shape contract:
+        diffusers convention:  [B, seq, heads, head_dim]  (after unflatten)
+        TTNN SDPA convention:  [B, heads, seq, head_dim]  (after transpose)
+        -> transpose before/after the TT SDPA call
+
+    Constraint: query sequence length must be divisible by 32.
+    Use is_sdpa_compatible() to check before applying this processor.
+
+    Compatible resolutions (14B, 4-chip TP):
+        256x256  9f  -> seq=768   (32x24)
+        256x256 49f  -> seq=3328  (32x104)
+        320x512 17f  -> seq=3200  (32x100)
+        480x768 17f  -> seq=7200  (32x225)
+        512x832 17f  -> seq=8320  (32x260)
+
+    Handles both self-attention (rotary_emb) and cross-attention (encoder kv).
+    """
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        rotary_emb=None,
+    ):
+        from tt_torch.custom_ops import scaled_dot_product_attention as tt_sdpa
+        from diffusers.models.transformers.transformer_wan import _get_qkv_projections
+
+        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        # [B, seq, inner_dim] -> [B, seq, heads, head_dim]
+        query = query.unflatten(2, (attn.heads, -1))
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+        # Apply RoPE (self-attention only)
+        if rotary_emb is not None:
+            def apply_rotary_emb(x, freqs_cos, freqs_sin):
+                x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
+                cos = freqs_cos[..., 0::2]
+                sin = freqs_sin[..., 1::2]
+                out = torch.empty_like(x)
+                out[..., 0::2] = x1 * cos - x2 * sin
+                out[..., 1::2] = x1 * sin + x2 * cos
+                return out.type_as(x)
+
+            query = apply_rotary_emb(query, *rotary_emb)
+            key = apply_rotary_emb(key, *rotary_emb)
+
+        # Transpose to TTNN SDPA shape: [B, heads, seq, head_dim]
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+
+        q_seq = query.shape[2]
+        assert q_seq % 32 == 0, (
+            f"WanTTSDPAAttnProcessor: query seq_len={q_seq} is not divisible by 32. "
+            f"Use is_sdpa_compatible(h, w, f) to check before applying. "
+            f"Try 256x256/9f, 320x512/17f, 480x768/17f, or 512x832/17f."
+        )
+
+        # Fused TT SDPA: emits stablehlo.CustomCall tt.scaled_dot_product_attention
+        # tt-mlir converts this to a single TTNN flash-attention kernel
+        hidden_states = tt_sdpa(query, key, value, is_causal=False)
+
+        # [B, heads, seq, head_dim] -> [B, seq, heads*head_dim]
+        hidden_states = hidden_states.transpose(1, 2)
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.type_as(query)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+
+def apply_tt_sdpa_to_transformer(transformer, height: int, width: int, num_frames: int):
+    """
+    Replace WanAttnProcessor with WanTTSDPAAttnProcessor on all blocks.
+
+    Call AFTER apply_tp_sharding_wan_transformer(): SDPA processor works on
+    per-device tensors (10 heads/chip for 4-chip TP) and the attention shapes
+    must reflect the post-sharding head count.
+
+    Returns True if replacement succeeded, False if seq_len not 32-aligned.
+    """
+    from diffusers.models.transformers.transformer_wan import WanAttnProcessor
+
+    seq_len = _compute_seq_len(height, width, num_frames)
+    if seq_len % 32 != 0:
+        print(f"  WARNING: TT SDPA skipped: seq_len={seq_len} not divisible by 32.")
+        print(f"    Compatible: 256x256/9f (768), 320x512/17f (3200), 480x768/17f (7200), 512x832/17f (8320)")
+        return False
+
+    tt_proc = WanTTSDPAAttnProcessor()
+    n_replaced = 0
+    for block in transformer.blocks:
+        if isinstance(block.attn1.processor, WanAttnProcessor):
+            block.attn1.set_processor(tt_proc)
+            n_replaced += 1
+        if isinstance(block.attn2.processor, WanAttnProcessor):
+            block.attn2.set_processor(tt_proc)
+            n_replaced += 1
+
+    print(f"  TT SDPA: replaced {n_replaced} attention processors")
+    print(f"    seq={seq_len} ({seq_len//32}x32), O(seq) attention vs O(seq^2) with standard SDPA")
+    print(f"    -> emits tt.scaled_dot_product_attention CustomCall -> tt-mlir SDPA kernel")
+    return True
+
+
 def apply_tp_sharding_wan_block(block, mesh, num_devices):
     """
     Apply Megatron-style tensor parallel sharding to a single WanTransformerBlock.
@@ -294,6 +435,7 @@ class WanT2VTPConfig:
         self.height = height
         self.width = width
         self.num_frames = num_frames
+        self.use_tt_sdpa = True  # use TT fused SDPA when seq_len % 32 == 0
 
 
 class WanT2VTPPipeline:
@@ -384,6 +526,12 @@ class WanT2VTPPipeline:
         # Apply TP sharding annotations
         print("  Applying tensor-parallel sharding...")
         apply_tp_sharding_wan_transformer(self.transformer, self.mesh, self.num_devices)
+
+        # Apply TT SDPA processors (if seq_len is 32-aligned)
+        if getattr(self.config, 'use_tt_sdpa', True):
+            apply_tt_sdpa_to_transformer(
+                self.transformer, self.config.height, self.config.width, self.config.num_frames
+            )
 
         # Patch forward for CPU pre-processing + graph breaks
         patch_transformer_with_tp(self.transformer, self.mesh, self.num_devices)
@@ -569,6 +717,7 @@ def run_wan_tp_pipeline(
     seed: Optional[int] = 42,
     output_path: str = "output_video_tp.mp4",
     optimization_level: int = 1,
+    use_tt_sdpa: bool = True,
 ):
     """Run the Wan T2V pipeline with tensor parallelism."""
     torch_xla.set_custom_compile_options({"optimization_level": optimization_level})
@@ -578,6 +727,7 @@ def run_wan_tp_pipeline(
         width=width,
         num_frames=num_frames,
     )
+    config.use_tt_sdpa = use_tt_sdpa
     pipeline = WanT2VTPPipeline(config)
     pipeline.load_models()
 
@@ -633,6 +783,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="generated_videos")
     parser.add_argument("--optimization_level", type=int, default=1)
+    parser.add_argument("--no_tt_sdpa", action="store_true",
+                        help="Disable TT fused SDPA (fall back to F.scaled_dot_product_attention)")
     args = parser.parse_args()
 
     xr.set_device_type("TT")
@@ -654,4 +806,5 @@ if __name__ == "__main__":
         seed=args.seed,
         output_path=output_path,
         optimization_level=args.optimization_level,
+        use_tt_sdpa=not args.no_tt_sdpa,
     )
