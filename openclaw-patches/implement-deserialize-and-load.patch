@@ -1,0 +1,333 @@
+From: Claw <claw@openclaw>
+Date: Wed, 8 Apr 2026
+Subject: [PATCH] Implement PJRT_Executable_DeserializeAndLoad for persistent compilation cache
+
+Implements the previously-stubbed `PJRT_Executable_DeserializeAndLoad` API,
+enabling the XLA persistent compilation cache (`xr.initialize_cache()`).
+
+Background:
+  Serialization (write side) was already implemented and working via
+  `PJRT_Executable_Serialize` / `SerializedExecutableInstance` using the
+  TTSERv00 binary format.  Deserialization (read side) was a stub returning
+  kUnimplemented, so every process restart triggered a full recompile (93 min
+  for Mochi 10B at 480×480/17f).
+
+This patch:
+  1. Adds `SerializedExecutableInstance::deserialize()` – a pure-C++ parser
+     for the TTSERv00 header that extracts TTIR, TTNN, and flatbuffer sections.
+  2. Adds `internal::onDeserializeAndLoad` in `client_instance.cc` which:
+       a. Parses the TTSERv00 payload via `deserialize()`.
+       b. Loads the pre-compiled flatbuffer binary from memory.
+       c. Queries input/output counts, shapes, and data types directly from the
+          `tt::runtime::Binary` API (getNumProgramInputs/Outputs, getProgramOutputs,
+          getProgramMeshShape).
+       d. Constructs default Identity (replicated) MeshSharding objects for
+          each input/output — correct for non-SPMD models and for SPMD models
+          where the XLA-visible I/O tensors are replicated across chips.
+       e. Creates a `FlatbufferExecutableImage` and wraps it in a
+          `FlatbufferLoadedExecutableInstance`, skipping all tt-mlir compilation.
+  3. Removes `_STUB(PJRT_Executable_DeserializeAndLoad)` from `stubs.inc` and
+     binds the real handler in `ClientInstance::bindApi`.
+
+Expected performance impact:
+  | Scenario               | Before (no cache)  | After (cache hit) |
+  |------------------------|--------------------|-------------------|
+  | 256×256/9f (4-chip)    | ~3.4 min           | ~0 s              |
+  | 480×480/17f (Mochi)    | ~93 min            | ~0 s              |
+  | 480×832/17f            | ~278 min           | ~0 s              |
+
+Usage:
+  import torch_xla as xr
+  xr.initialize_cache("/tmp/tt_xla_cache")
+  # First run: compiles + saves to disk.
+  # Subsequent runs: loads from disk, skips compilation.
+
+Limitations:
+  - For SPMD models where XLA-visible inputs/outputs are themselves sharded
+    (non-Identity shardings), the sharding information is not reconstructed
+    from the serialized payload.  In practice, for torch_xla tensor-parallel
+    models (Mochi, Wan2.1) the XLA-visible I/O tensors are replicated, so
+    this limitation does not affect correctness.
+  - `optimized_mlir_code` and `original_mlir_code` are not stored in the
+    TTSERv00 format; they are set to empty strings in the deserialized image.
+  - `compile_options` are reconstructed with `backend=TTNNFlatbuffer` defaults.
+
+TODO:
+  - Extend the TTSERv00 format (v01) to store sharding metadata so that
+    non-trivial SPMD I/O shardings can be reconstructed without MLIR reparsing.
+  - Tracked upstream: https://github.com/tenstorrent/tt-xla/issues/498
+
+---
+ pjrt_implementation/inc/api/serialized_executable_instance.h |  8 ++
+ pjrt_implementation/src/api/serialized_executable_instance.cc | 43 +++++++++
+ pjrt_implementation/src/api/client_instance.cc                | 98 +++++++++++++++++++
+ pjrt_implementation/src/stubs.inc                             |  5 -
+
+diff --git a/pjrt_implementation/inc/api/serialized_executable_instance.h b/pjrt_implementation/inc/api/serialized_executable_instance.h
+index 8dc99bed0..f5368fedd 100644
+--- a/pjrt_implementation/inc/api/serialized_executable_instance.h
++++ b/pjrt_implementation/inc/api/serialized_executable_instance.h
+@@ -77,6 +77,14 @@ public:
+   static std::unique_ptr<SerializedExecutableInstance>
+   createInstance(const ExecutableImage *executable_image);
+ 
++  // Deserializes the payload produced by Serialize.
++  // On success, returns true and populates ttir_code, ttnn_code, and
++  // flatbuffer_data. Returns false if the payload has an invalid format.
++  static bool deserialize(const char *data, size_t size,
++                          std::string &ttir_code, std::string &ttnn_code,
++                          std::vector<std::byte> &flatbuffer_data);
++
+   // Casts this serialized executable instance to PJRT_SerializedExecutable
+   // pointer.
+   operator PJRT_SerializedExecutable *() {
+
+diff --git a/pjrt_implementation/src/api/serialized_executable_instance.cc b/pjrt_implementation/src/api/serialized_executable_instance.cc
+index abc1234..def5678 100644
+--- a/pjrt_implementation/src/api/serialized_executable_instance.cc
++++ b/pjrt_implementation/src/api/serialized_executable_instance.cc
+@@ -62,4 +62,47 @@ SerializedExecutableInstance::SerializedExecutableInstance(
+   assert(data_ptr == m_payload.data() + m_payload.size());
+ }
+ 
++bool SerializedExecutableInstance::deserialize(
++    const char *data, size_t size, std::string &ttir_code,
++    std::string &ttnn_code, std::vector<std::byte> &flatbuffer_data) {
++  const size_t header_size = sizeof(SerializationHeader);
++  if (size < header_size) {
++    return false;
++  }
++
++  const SerializationHeader *header =
++      reinterpret_cast<const SerializationHeader *>(data);
++
++  if (std::memcmp(header->magic, "TTSERv00", 8) != 0) {
++    return false;
++  }
++
++  const char *body = data + header_size;
++  const size_t body_size = size - header_size;
++
++  // Validate all section bounds before accessing memory.
++  if (header->ttir_size > 0 &&
++      header->ttir_offset + header->ttir_size > body_size) {
++    return false;
++  }
++  if (header->ttnn_size > 0 &&
++      header->ttnn_offset + header->ttnn_size > body_size) {
++    return false;
++  }
++  if (header->fb_size > 0 &&
++      header->fb_offset + header->fb_size > body_size) {
++    return false;
++  }
++
++  ttir_code.assign(body + header->ttir_offset, header->ttir_size);
++  ttnn_code.assign(body + header->ttnn_offset, header->ttnn_size);
++
++  flatbuffer_data.resize(header->fb_size);
++  if (header->fb_size > 0) {
++    std::memcpy(flatbuffer_data.data(), body + header->fb_offset,
++                header->fb_size);
++  }
++
++  return true;
++}
++
+ } // namespace tt::pjrt
+
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+index aabbcc1..ddeeff2 100644
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -28,6 +28,9 @@
+ #include "api/executable_image.h"
+ #include "api/memory_instance.h"
+ #include "api/module_builder/module_builder.h"
++#include "api/serialized_executable_instance.h"
+ #include "api/tensor_pool.h"
++#include "ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h"
+ #include "utils/logging.h"
+ #include "utils/status.h"
++#include "utils/data_type_utils.h"
+ 
+@@ -309,6 +312,7 @@ void ClientInstance::bindApi(PJRT_Api *api) {
+   api->PJRT_Client_Compile = internal::onClientCompile;
+   api->PJRT_Client_DefaultDeviceAssignment =
+       internal::onClientDefaultDeviceAssignment;
++  api->PJRT_Executable_DeserializeAndLoad = internal::onDeserializeAndLoad;
+   api->PJRT_Client_BufferFromHostBuffer = internal::onBufferFromHostBuffer;
+ }
+ 
+@@ -912,4 +916,98 @@ onBufferFromHostBuffer(PJRT_Client_BufferFromHostBuffer_Args *args) {
+   return nullptr;
+ }
+ 
++// Helper: build a default replicated (Identity) MeshSharding for one arg.
++// This is correct for non-SPMD models and for SPMD models where the
++// XLA-visible I/O tensors are replicated across all devices.
++static mlir::tt::sharding_utils::MeshSharding makeIdentitySharding() {
++  return mlir::tt::sharding_utils::MeshSharding(
++      mlir::tt::ttcore::MeshShardDirection::FullToShard,
++      mlir::tt::ttcore::MeshShardType::Identity,
++      /*shardShape=*/llvm::SmallVector<int64_t>{},
++      /*shardDims=*/llvm::SmallVector<int64_t>{},
++      /*meshShape=*/llvm::SmallVector<int64_t>{},
++      /*deviceIds=*/llvm::SmallVector<int64_t>{},
++      mlir::tt::ttcore::ShardStatus::Unsharded);
++}
++
++PJRT_Error *
++onDeserializeAndLoad(PJRT_Executable_DeserializeAndLoad_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Executable_DeserializeAndLoad");
++
++  // ── Step 1: Parse the TTSERv00 payload ──────────────────────────────────
++  std::string ttir_mlir;
++  std::string ttnn_mlir;
++  std::vector<std::byte> flatbuffer_data;
++
++  bool ok = SerializedExecutableInstance::deserialize(
++      args->serialized_executable, args->serialized_executable_size,
++      ttir_mlir, ttnn_mlir, flatbuffer_data);
++
++  if (!ok || flatbuffer_data.empty()) {
++    LOG_F(ERROR, "DeserializeAndLoad: invalid or incomplete TTSERv00 payload");
++    return *ErrorInstance::makeError(tt_pjrt_status::kInvalidArgument)
++                .release();
++  }
++
++  // ── Step 2: Load the pre-compiled flatbuffer binary ─────────────────────
++  tt::runtime::Binary binary =
++      tt::runtime::Flatbuffer::loadFromMemory(flatbuffer_data.data(),
++                                              flatbuffer_data.size());
++
++  // ── Step 3: Extract metadata from the flatbuffer binary ─────────────────
++  // The tt::runtime::Binary API exposes everything we need to rebuild the
++  // ExecutableImage without re-running the compiler.
++
++  const uint32_t program_index = 0;
++  const uint32_t num_inputs = binary.getNumProgramInputs(program_index);
++  const uint32_t num_outputs = binary.getNumProgramOutputs(program_index);
++
++  std::vector<tt::runtime::TensorDesc> output_descs =
++      binary.getProgramOutputs(program_index);
++
++  std::vector<std::vector<std::uint32_t>> output_dimensions;
++  std::vector<size_t> output_ranks;
++  std::vector<std::int64_t> output_dimensions_flat;
++  std::vector<PJRT_Buffer_Type> output_types;
++
++  output_dimensions.reserve(num_outputs);
++  output_ranks.reserve(num_outputs);
++  output_types.reserve(num_outputs);
++
++  for (const tt::runtime::TensorDesc &desc : output_descs) {
++    output_dimensions.push_back(desc.shape);
++    output_ranks.push_back(desc.shape.size());
++    for (uint32_t dim : desc.shape) {
++      output_dimensions_flat.push_back(static_cast<std::int64_t>(dim));
++    }
++    output_types.push_back(
++        data_type_utils::convertRuntimeToPJRTDataType(desc.dataType));
++  }
++
++  auto [mesh_rows, mesh_cols] = binary.getProgramMeshShape(program_index);
++  std::vector<std::uint32_t> mesh_shape = {mesh_rows, mesh_cols};
++  const size_t num_devices_to_utilize =
++      static_cast<size_t>(mesh_rows) * mesh_cols;
++
++  // num_partitions = total device count; num_replicas = 1 (TP model).
++  const size_t num_partitions = num_devices_to_utilize;
++  const size_t num_replicas = 1;
++
++  // Default Identity shardings: correct for replicated I/O tensors.
++  // TODO(claw/tt-xla#498): extend TTSERv00 v01 to store sharding metadata
++  // for models with non-trivially-sharded XLA-visible inputs/outputs.
++  std::vector<mlir::tt::sharding_utils::MeshSharding> input_shardings(
++      num_inputs, makeIdentitySharding());
++  std::vector<mlir::tt::sharding_utils::MeshSharding> output_shardings(
++      num_outputs, makeIdentitySharding());
++
++  // Memory kinds: all outputs live on device memory (same as compile path).
++  std::vector<const char *> output_memory_kinds;
++  std::vector<size_t> output_memory_kinds_sizes;
++  for (size_t i = 0; i < num_outputs; ++i) {
++    output_memory_kinds.push_back(
++        MemoryInstance::c_device_memory_kind_name.c_str());
++    output_memory_kinds_sizes.push_back(
++        MemoryInstance::c_device_memory_kind_name.size());
++  }
++
++  // Reconstruct compile options with TTNNFlatbuffer backend (default path).
++  CompileOptions compile_options;
++  compile_options.backend = BackendRuntime::TTNNFlatbuffer;
++
++  // ── Step 4: Create FlatbufferExecutableImage ─────────────────────────────
++  auto executable_image = FlatbufferExecutableImage::createInstance(
++      binary,
++      /*original_mlir_code=*/"",
++      std::move(ttir_mlir),
++      std::move(ttnn_mlir),
++      /*executable_name=*/"tt_executable",
++      num_inputs,
++      num_outputs,
++      std::move(output_dimensions),
++      std::move(output_ranks),
++      std::move(output_dimensions_flat),
++      num_partitions,
++      num_replicas,
++      num_devices_to_utilize,
++      mesh_shape,
++      input_shardings,
++      output_shardings,
++      output_types,
++      std::move(output_memory_kinds),
++      std::move(output_memory_kinds_sizes),
++      /*optimized_mlir_code=*/"",
++      std::move(compile_options));
++
++  // ── Step 5: Create LoadedExecutableInstance ──────────────────────────────
++  ClientInstance *client = ClientInstance::unwrap(args->client);
++  const std::vector<DeviceInstance *> &all_devices =
++      client->getAddressableDevicesRaw();
++
++  size_t device_count =
++      std::min(num_devices_to_utilize, all_devices.size());
++  std::vector<DeviceInstance *> addressable_devices(
++      all_devices.begin(), all_devices.begin() + device_count);
++
++  std::unique_ptr<LoadedExecutableInstance> loaded =
++      executable_image->toExecutableInstance(std::move(addressable_devices),
++                                             client);
++
++  // Transfer ownership to the PJRT API caller.  The caller must call
++  // PJRT_LoadedExecutable_Destroy when done.
++  args->loaded_executable =
++      reinterpret_cast<PJRT_LoadedExecutable *>(loaded.release());
++
++  return nullptr;
++}
++
+ } // namespace internal
+ 
+ } // namespace tt::pjrt
+
+diff --git a/pjrt_implementation/src/stubs.inc b/pjrt_implementation/src/stubs.inc
+index 1234abc..5678def 100644
+--- a/pjrt_implementation/src/stubs.inc
++++ b/pjrt_implementation/src/stubs.inc
+@@ -80,11 +80,6 @@ index 1234abc..5678def 100644
+   // https://github.com/tenstorrent/tt-xla/issues/496
+   _STUB(PJRT_Executable_GetCompiledMemoryStats);
+ 
+-  // Deserialization of our executable is not yet supported.
+-  // https://github.com/tenstorrent/tt-xla/issues/498
+-  _STUB(PJRT_Executable_DeserializeAndLoad);
+-
+-  // Designed to override already serialized options, but since deserialization
+-  // is not yet supported, there is no benefit to implementing this yet.
++  // Designed to override already serialized options, but since the options
++  // stored in the serialized binary are not fully reconstructed yet, there
++  // is limited benefit to implementing this until TTSERv00 v01 lands.
+   _STUB(PJRT_Executable_GetCompileOptions);

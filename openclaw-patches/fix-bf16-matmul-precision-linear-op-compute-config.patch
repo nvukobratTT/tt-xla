@@ -1,0 +1,22 @@
+--- a/third_party/tt-mlir/src/tt-mlir/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/third_party/tt-mlir/src/tt-mlir/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -559,8 +559,14 @@ createOp(FlatbufferObjectCache &cache, LinearOp op) {
+     }
+   }
+ 
+   auto activation = toFlatbuffer(cache, op.getActivation()).value_or(0);
++
++  // Serialize compute_config — same as MatmulOp.
++  // Without this, when MatmulWithBiasFusionPattern fires (matmul+add → LinearOp),
++  // fp32_dest_acc_en and packer_l1_acc settings are silently dropped at the
++  // flatbuffer boundary, causing precision regression vs plain matmul.
++  std::optional<
++      ::flatbuffers::Offset<::tt::target::ttnn::DeviceComputeKernelConfig>>
++      computeConfig = toFlatbuffer(cache, op.getComputeConfig());
++
+   return ::tt::target::ttnn::CreateLinearOp(
+       *cache.fbb, a, b, bias, output, op.getTransposeA(), op.getTransposeB(),
+-      matmulProgramConfigType, matmulProgramConfigDesc, activation);
++      matmulProgramConfigType, matmulProgramConfigDesc, activation,
++      computeConfig.value_or(0));
+ }

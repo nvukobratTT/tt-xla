@@ -1,0 +1,242 @@
+From: nvukobratTT <nvukobrat@tenstorrent.com>
+Subject: [PATCH] Add TTNNCheckDRAMBudget pre-flight pass to catch OOM before execution
+
+Adds a new MLIR pass `ttnn-check-dram-budget` that runs after
+`ttnn-deallocate` and simulates tensor lifetimes to estimate peak DRAM
+usage per chip. If the estimate exceeds the device's usable DRAM
+budget, the pass emits a compile-time error with an actionable message
+instead of letting the program reach execution and hang silently (GH #11).
+
+For TP-sharded models (SPMD), tensor shapes in the IR already reflect
+per-chip sizes after the SPMD sharding pass, so the check compares
+against the single-chip DRAM budget directly.
+
+The pass also emits a warning at 90% utilisation to provide an early
+signal before the threshold is crossed.
+
+Fixes: https://github.com/nvukobratTT/tt-xla/issues/11 (Solution 3)
+---
+ .../ttmlir/Dialect/TTNN/Transforms/Passes.td  |  22 +++
+ .../TTNN/Transforms/TTNNCheckDRAMBudget.cpp   | 129 ++++++++++++++++++
+ .../Dialect/TTNN/Pipelines/TTNNPipelines.cpp  |   4 +
+ .../Dialect/TTNN/Transforms/CMakeLists.txt    |   1 +
+ 4 files changed, 156 insertions(+)
+ create mode 100644 lib/Dialect/TTNN/Transforms/TTNNCheckDRAMBudget.cpp
+
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+index xxxxxxx..xxxxxxx 100644
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+@@ -14,6 +14,28 @@ def TTNNDeallocate: Pass<"ttnn-deallocate", "::mlir::ModuleOp"> {
+   }];
+ }
+ 
++def TTNNCheckDRAMBudget : Pass<"ttnn-check-dram-budget", "::mlir::ModuleOp"> {
++  let summary = "Check estimated peak DRAM usage against per-chip budget.";
++  let description = [{
++    After deallocation ops are inserted, this pass simulates tensor
++    lifetimes to estimate peak DRAM usage per chip. If the estimated peak
++    exceeds the device's usable DRAM budget, the pass emits a compile-time
++    error to prevent a silent runtime hang (see GH #11).
++
++    The estimation works by walking all ops in execution order, adding the
++    DRAM bytes of each result tensor to a running total, and subtracting
++    bytes when a DeallocateOp frees that tensor. Function arguments
++    (model weights) are treated as permanently live.
++
++    For TP-sharded (SPMD) models, tensor shapes in the IR already reflect
++    per-chip sizes after SPMD sharding, so the check is against the
++    single-chip DRAM budget.
++
++    A warning is also emitted at 90% utilisation to provide an early signal
++    before the budget is exceeded.
++  }];
++}
++
+ def TTNNDecomposeLayouts: Pass<"ttnn-decompose-layouts", "::mlir::ModuleOp"> {
+   let summary = "Decompose ToLayoutOps to more granular memory ops.";
+   let description = [{
+
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNCheckDRAMBudget.cpp b/lib/Dialect/TTNN/Transforms/TTNNCheckDRAMBudget.cpp
+new file mode 100644
+index 0000000..xxxxxxx
+--- /dev/null
++++ b/lib/Dialect/TTNN/Transforms/TTNNCheckDRAMBudget.cpp
+@@ -0,0 +1,129 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
++#include "ttmlir/Dialect/TTCore/IR/Utils.h"
++#include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
++#include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
++#include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
++
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/IR/BuiltinTypes.h"
++#include "mlir/IR/Diagnostics.h"
++
++namespace mlir::tt::ttnn {
++#define GEN_PASS_DEF_TTNNCHECKDRAMBUDGET
++#include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
++
++namespace {
++
++// Returns the total DRAM bytes consumed by a tensor value when it is live
++// in device DRAM. Returns 0 for non-DRAM tensors (L1, system memory, etc.).
++//
++// For interleaved DRAM (virtual grid N×M, data spread across DRAM channels):
++//   totalBytes = shardSizeBytes × gridVolume (= whole tensor before sharding)
++// For sharded DRAM (N×M physical shards, each on a different set of cores):
++//   totalBytes = shardSizeBytes × gridVolume (= whole tensor)
++//
++// Both cases reduce to: shardSizeBytes × gridVolume.
++static uint64_t getDRAMTensorBytes(Value value) {
++  auto tensorType = mlir::dyn_cast<RankedTensorType>(value.getType());
++  if (!tensorType)
++    return 0;
++
++  auto enc = tensorType.getEncoding();
++  if (!enc)
++    return 0;
++
++  auto layoutAttr = mlir::dyn_cast<TTNNLayoutAttr>(enc);
++  if (!layoutAttr || !layoutAttr.hasDRAMBufferType())
++    return 0;
++
++  uint64_t gridVol = layoutAttr.getGrid().getGridVolume();
++  return layoutAttr.getShardSizeInBytes() * gridVol;
++}
++
++} // namespace
++
++class TTNNCheckDRAMBudget
++    : public impl::TTNNCheckDRAMBudgetBase<TTNNCheckDRAMBudget> {
++public:
++  using impl::TTNNCheckDRAMBudgetBase<
++      TTNNCheckDRAMBudget>::TTNNCheckDRAMBudgetBase;
++
++  void runOnOperation() final {
++    ModuleOp moduleOp = getOperation();
++
++    // Determine per-chip DRAM budget from the system descriptor attached to
++    // the module. Walk until we find the first op with a chip descriptor.
++    std::optional<uint64_t> dramBudgetOpt;
++    moduleOp->walk([&](Operation *op) -> WalkResult {
++      if (dramBudgetOpt.has_value())
++        return WalkResult::interrupt();
++
++      auto chipDesc = ttcore::getOpChipDescAttr(op);
++      if (!chipDesc)
++        return WalkResult::advance();
++
++      // getUsableDramChannelSize() = dramUnreservedEnd - dramUnreservedBase.
++      // Total usable DRAM per chip = usable per channel × number of channels.
++      uint64_t usablePerChannel =
++          static_cast<uint64_t>(chipDesc.getUsableDramChannelSize());
++      uint64_t numChannels =
++          static_cast<uint64_t>(chipDesc.getNumDramChannels());
++      dramBudgetOpt = usablePerChannel * numChannels;
++      return WalkResult::interrupt();
++    });
++
++    if (!dramBudgetOpt.has_value()) {
++      // No device info available — skip the check (e.g., CPU-only compile).
++      return;
++    }
++
++    const uint64_t dramBudgetBytes = *dramBudgetOpt;
++    // Warn at 90% utilisation so users have a chance to adjust before OOM.
++    const uint64_t warnThreshold =
++        static_cast<uint64_t>(static_cast<double>(dramBudgetBytes) * 0.90);
++
++    moduleOp->walk([&](func::FuncOp funcOp) {
++      uint64_t currentDRAMBytes = 0;
++      uint64_t peakDRAMBytes = 0;
++      Operation *peakOp = nullptr;
++
++      // Model weights and inputs passed as function arguments are live for
++      // the entire function duration.
++      for (BlockArgument arg : funcOp.getArguments())
++        currentDRAMBytes += getDRAMTensorBytes(arg);
++
++      peakDRAMBytes = currentDRAMBytes;
++
++      // Walk ops in the function body in program order.
++      funcOp.walk([&](Operation *op) {
++        if (auto deallocOp = mlir::dyn_cast<DeallocateOp>(op)) {
++          // Tensor freed — remove its contribution from the live set.
++          uint64_t freed = getDRAMTensorBytes(deallocOp.getInput());
++          if (freed <= currentDRAMBytes)
++            currentDRAMBytes -= freed;
++          return;
++        }
++
++        // Every result produced by this op may land in DRAM.
++        for (Value result : op->getResults())
++          currentDRAMBytes += getDRAMTensorBytes(result);
++
++        if (currentDRAMBytes > peakDRAMBytes) {
++          peakDRAMBytes = currentDRAMBytes;
++          peakOp = op;
++        }
++      });
++
++      const uint64_t peakMiB = peakDRAMBytes / (1024ULL * 1024);
++      const uint64_t budgetMiB = dramBudgetBytes / (1024ULL * 1024);
++
++      if (peakDRAMBytes > dramBudgetBytes) {
++        InFlightDiagnostic diag =
++            peakOp ? peakOp->emitError() : funcOp->emitError();
++        diag << "[TTNNCheckDRAMBudget] Estimated peak DRAM usage "
++             << peakMiB << " MiB exceeds per-chip DRAM budget " << budgetMiB
++             << " MiB. This model will hang silently at runtime.\n"
++             << "  Possible fixes:\n"
++             << "  1. Enable SDPA fusion:  --enable-fusing (eliminates O(n²) "
++                "attention buffers)\n"
++             << "  2. Reduce sequence length below the OOM threshold\n"
++             << "  3. Reduce batch size\n"
++             << "  4. Use opt_level=0 (lower memory overhead, slower compute)\n"
++             << "  5. Use XLA rematerialization: "
++                "XLA_FLAGS='--xla_rematerialization=true'";
++        signalPassFailure();
++      } else if (peakDRAMBytes > warnThreshold) {
++        (peakOp ? peakOp->emitWarning() : funcOp->emitWarning())
++            << "[TTNNCheckDRAMBudget] Estimated peak DRAM usage " << peakMiB
++            << " MiB is "
++            << (peakDRAMBytes * 100 / dramBudgetBytes) << "% of per-chip "
++            << "budget (" << budgetMiB
++            << " MiB). Risk of DRAM OOM at larger sequence lengths.";
++      }
++    });
++  }
++};
++
++} // namespace mlir::tt::ttnn
+
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+index xxxxxxx..xxxxxxx 100644
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -370,6 +370,10 @@ void createTTIRToTTNNDevicePipeline(
+ 
+     createTTNNPipelineDeallocPass(devicePm, options);
+ 
++    // After dealloc ops are in place, check that estimated peak DRAM usage
++    // fits in the per-chip DRAM budget. Catches silent OOM hangs early.
++    devicePm.addPass(createTTNNCheckDRAMBudget());
++
+     if (options.ttnnPerfMetricsEnabled) {
+
+diff --git a/lib/Dialect/TTNN/Transforms/CMakeLists.txt b/lib/Dialect/TTNN/Transforms/CMakeLists.txt
+index xxxxxxx..xxxxxxx 100644
+--- a/lib/Dialect/TTNN/Transforms/CMakeLists.txt
++++ b/lib/Dialect/TTNN/Transforms/CMakeLists.txt
+@@ -10,6 +10,7 @@ add_mlir_dialect_library(MLIRTTNNTransforms
+         TTNNAdjustDeallocs.cpp
+         TTNNCollaspeD2M.cpp
+         TTNNCollectPerfMetrics.cpp
++        TTNNCheckDRAMBudget.cpp
+         TTNND2MFusing.cpp
+         TTNNFileSplit.cpp

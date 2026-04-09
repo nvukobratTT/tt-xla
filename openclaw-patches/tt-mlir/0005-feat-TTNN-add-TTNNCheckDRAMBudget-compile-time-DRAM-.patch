@@ -1,0 +1,446 @@
+From 2ac6b6ae820109ad7f2080abce3788f3ac4302b2 Mon Sep 17 00:00:00 2001
+From: nvukobratTT <nvukobratTT@users.noreply.github.com>
+Date: Thu, 9 Apr 2026 00:19:14 +0000
+Subject: [PATCH 5/8] feat(TTNN): add TTNNCheckDRAMBudget compile-time DRAM OOM
+ detection pass
+
+Adds a new MLIR pass ttnn-check-dram-budget that runs after ttnn-deallocate
+and detects DRAM OOM conditions at compile time instead of letting the program
+hang silently at runtime (see GH #11).
+
+The pass simulates tensor lifetimes using a first-fit freelist allocator --
+mirroring what tt-metal does at runtime.  This catches two failure modes:
+
+1. Classic total-budget OOM (estimated peak > per-chip budget)
+2. Fragmentation-induced OOM: total free DRAM is sufficient but no single
+   contiguous block is large enough for the requested tensor.  This is the
+   actual failure mode for Mochi 10B at seq_len=2080 on 4-chip SPMD TP:
+   the sum estimator shows ~12-14 GiB peak vs 34 GiB budget (PASS) but the
+   first-fit freelist correctly signals allocation failure.
+
+Implementation:
+- FreeListAllocator: minimal first-fit allocator over a sorted vector of
+  FreeRange structs.  Freed ranges are merged with neighbours.  All sizes
+  are rounded up to DRAM_ALIGNMENT (32 bytes) to match tt-metal.
+- tensorBase DenseMap tracks where each live tensor was placed so the
+  exact range can be returned at DeallocateOp time.
+- For symmetric SPMD TP the IR already reflects per-chip tensor sizes after
+  the SPMD sharding pass -- one freelist with the per-chip budget suffices.
+- Warning emitted at 90% utilisation as an early signal.
+- Two distinct error messages: fragmentation OOM names the requested block
+  size, the largest available block, and the total free bytes.
+
+GH: https://github.com/nvukobratTT/tt-xla/issues/11 (Solution 3 v2)
+---
+ .../ttmlir/Dialect/TTNN/Transforms/Passes.td  |  19 +
+ lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp  |   4 +
+ lib/Dialect/TTNN/Transforms/CMakeLists.txt    |   1 +
+ .../TTNN/Transforms/TTNNCheckDRAMBudget.cpp   | 339 ++++++++++++++++++
+ 4 files changed, 363 insertions(+)
+ create mode 100644 lib/Dialect/TTNN/Transforms/TTNNCheckDRAMBudget.cpp
+
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+index 2b297065c..0fd3c652e 100644
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+@@ -14,6 +14,25 @@ def TTNNDeallocate: Pass<"ttnn-deallocate", "::mlir::ModuleOp"> {
+   }];
+ }
+ 
++def TTNNCheckDRAMBudget : Pass<"ttnn-check-dram-budget", "::mlir::ModuleOp"> {
++  let summary = "Check estimated peak DRAM usage against per-chip budget.";
++  let description = [{
++    After deallocation ops are inserted, this pass simulates tensor
++    lifetimes using a first-fit freelist allocator to detect both classic
++    budget overflows *and* fragmentation-induced OOMs -- cases where total
++    free DRAM is sufficient but no single contiguous block large enough for
++    the requested tensor can be found (the real failure mode for Mochi 10B
++    at seq_len=2080 on 4-chip SPMD TP; see GH #11).
++
++    For TP-sharded (SPMD) models, tensor shapes in the IR already reflect
++    per-chip sizes after SPMD sharding, so a single freelist with the
++    single-chip DRAM budget is sufficient.
++
++    Two diagnostic levels: ERROR when an allocation fails (fragmentation or
++    total OOM); WARNING at 90% utilisation as an early signal.
++  }];
++}
++
+ def TTNNDecomposeLayouts: Pass<"ttnn-decompose-layouts", "::mlir::ModuleOp"> {
+   let summary = "Decompose ToLayoutOps to more granular memory ops.";
+   let description = [{
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+index dc55e7d58..21f4d5e8d 100644
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -383,6 +383,10 @@ void createTTIRToTTNNDevicePipeline(
+ 
+     createTTNNPipelineDeallocPass(devicePm, options);
+ 
++    // After dealloc ops are in place, check that estimated peak DRAM usage
++    // fits in the per-chip DRAM budget. Catches silent OOM hangs early.
++    devicePm.addPass(createTTNNCheckDRAMBudget());
++
+     if (options.ttnnPerfMetricsEnabled) {
+       ttnn::TTNNCollectPerfMetricsOptions metricsOptions{
+           options.ttnnPerfMetricsOutputFile,
+diff --git a/lib/Dialect/TTNN/Transforms/CMakeLists.txt b/lib/Dialect/TTNN/Transforms/CMakeLists.txt
+index 29040a0eb..b34d00a68 100644
+--- a/lib/Dialect/TTNN/Transforms/CMakeLists.txt
++++ b/lib/Dialect/TTNN/Transforms/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_mlir_dialect_library(MLIRTTNNTransforms
+         OptimizerPasses/TTNNPrepareConv2dWeightsAndBias.cpp
+         TTNNAdjustDeallocs.cpp
+         TTNNCollaspeD2M.cpp
++        TTNNCheckDRAMBudget.cpp
+         TTNNCollectPerfMetrics.cpp
+         TTNND2MFusing.cpp
+         TTNNFileSplit.cpp
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNCheckDRAMBudget.cpp b/lib/Dialect/TTNN/Transforms/TTNNCheckDRAMBudget.cpp
+new file mode 100644
+index 000000000..a00ea550e
+--- /dev/null
++++ b/lib/Dialect/TTNN/Transforms/TTNNCheckDRAMBudget.cpp
+@@ -0,0 +1,339 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
++#include "ttmlir/Dialect/TTCore/IR/Utils.h"
++#include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
++#include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
++#include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
++
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/IR/BuiltinTypes.h"
++#include "mlir/IR/Diagnostics.h"
++#include "mlir/IR/Value.h"
++#include "llvm/ADT/DenseMap.h"
++
++#include <algorithm>
++#include <cassert>
++#include <optional>
++#include <vector>
++
++namespace mlir::tt::ttnn {
++#define GEN_PASS_DEF_TTNNCHECKDRAMBUDGET
++#include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
++
++namespace {
++
++// ---------------------------------------------------------------------------
++// Tensor size helper
++// ---------------------------------------------------------------------------
++
++/// Returns the total DRAM bytes consumed by `value` when it is live in device
++/// DRAM.  Returns 0 for non-DRAM tensors (L1, host memory, etc.).
++//
++// Both DRAM interleaved and DRAM sharded layouts satisfy:
++//   totalBytes = getShardSizeInBytes() x getGridVolume()
++//
++// For symmetric SPMD TP models the IR already reflects per-chip tensor sizes
++// after the SPMD sharding pass, so this gives the per-chip allocation size.
++static uint64_t getDRAMTensorBytes(Value value) {
++  auto tensorType = mlir::dyn_cast<RankedTensorType>(value.getType());
++  if (!tensorType)
++    return 0;
++
++  auto enc = tensorType.getEncoding();
++  if (!enc)
++    return 0;
++
++  auto layoutAttr = mlir::dyn_cast<TTNNLayoutAttr>(enc);
++  if (!layoutAttr || !layoutAttr.hasDRAMBufferType())
++    return 0;
++
++  uint64_t gridVol = layoutAttr.getGrid().getGridVolume();
++  return layoutAttr.getShardSizeInBytes() * gridVol;
++}
++
++// ---------------------------------------------------------------------------
++// First-fit freelist allocator
++// ---------------------------------------------------------------------------
++
++/// DRAM allocations in tt-metal are aligned to L1_ALIGNMENT == 32 bytes.
++static constexpr uint64_t DRAM_ALIGNMENT = 32;
++
++static inline uint64_t alignUp(uint64_t bytes) {
++  return (bytes + DRAM_ALIGNMENT - 1) & ~(DRAM_ALIGNMENT - 1);
++}
++
++/// A contiguous free region in the simulated DRAM address space.
++struct FreeRange {
++  uint64_t base; ///< First byte of the free region.
++  uint64_t size; ///< Length in bytes.
++};
++
++/// Minimal first-fit freelist allocator that mirrors the behaviour of the
++/// tt-metal DRAM allocator: ranges sorted by base address, first fit chosen,
++/// freed ranges merged with neighbours.
++///
++/// All sizes passed in must already be aligned to DRAM_ALIGNMENT.
++class FreeListAllocator {
++public:
++  explicit FreeListAllocator(uint64_t totalBytes) : totalBytes_(totalBytes) {
++    ranges_.push_back({0, totalBytes});
++  }
++
++  /// First-fit allocation of `bytes` (caller must pre-align).
++  /// Returns the base address on success, or std::nullopt when no
++  /// sufficiently large contiguous block is available.
++  std::optional<uint64_t> allocate(uint64_t bytes) {
++    assert(bytes % DRAM_ALIGNMENT == 0 && "caller must align");
++    if (bytes == 0)
++      return uint64_t{0}; // zero-size sentinel
++
++    for (auto it = ranges_.begin(); it != ranges_.end(); ++it) {
++      if (it->size >= bytes) {
++        uint64_t base = it->base;
++        it->base += bytes;
++        it->size -= bytes;
++        if (it->size == 0)
++          ranges_.erase(it);
++        return base;
++      }
++    }
++    return std::nullopt; // fragmentation OOM
++  }
++
++  /// Return `bytes` bytes starting at `base` to the freelist.
++  /// Adjacent free ranges are merged so future large allocations can succeed.
++  void free(uint64_t base, uint64_t bytes) {
++    if (bytes == 0)
++      return;
++
++    // Find insertion point to keep the list sorted by base.
++    auto it = std::lower_bound(ranges_.begin(), ranges_.end(), base,
++                               [](const FreeRange &r, uint64_t b) {
++                                 return r.base < b;
++                               });
++    it = ranges_.insert(it, {base, bytes});
++
++    // Merge with successor if adjacent.
++    if (auto next = std::next(it); next != ranges_.end()) {
++      if (it->base + it->size == next->base) {
++        it->size += next->size;
++        ranges_.erase(next);
++      }
++    }
++    // Merge with predecessor if adjacent.
++    if (it != ranges_.begin()) {
++      auto prev = std::prev(it);
++      if (prev->base + prev->size == it->base) {
++        prev->size += it->size;
++        ranges_.erase(it);
++      }
++    }
++  }
++
++  uint64_t largestFreeBlock() const {
++    uint64_t mx = 0;
++    for (const auto &r : ranges_)
++      mx = std::max(mx, r.size);
++    return mx;
++  }
++
++  uint64_t totalFreeBytes() const {
++    uint64_t sum = 0;
++    for (const auto &r : ranges_)
++      sum += r.size;
++    return sum;
++  }
++
++  uint64_t totalBytes() const { return totalBytes_; }
++
++private:
++  uint64_t totalBytes_;
++  std::vector<FreeRange> ranges_; // sorted by base address
++};
++
++} // namespace
++
++class TTNNCheckDRAMBudget
++    : public impl::TTNNCheckDRAMBudgetBase<TTNNCheckDRAMBudget> {
++public:
++  using impl::TTNNCheckDRAMBudgetBase<
++      TTNNCheckDRAMBudget>::TTNNCheckDRAMBudgetBase;
++
++  void runOnOperation() final {
++    ModuleOp moduleOp = getOperation();
++
++    // ------------------------------------------------------------------
++    // 1. Determine per-chip DRAM budget from the SystemDesc attached to
++    //    the module.  Walk until we encounter an op that carries a chip
++    //    descriptor attribute (injected by the SPMD lowering pipeline).
++    // ------------------------------------------------------------------
++    std::optional<uint64_t> dramBudgetOpt;
++    moduleOp->walk([&](Operation *op) -> WalkResult {
++      if (dramBudgetOpt.has_value())
++        return WalkResult::interrupt();
++
++      auto chipDesc = ttcore::getOpChipDescAttr(op);
++      if (!chipDesc)
++        return WalkResult::advance();
++
++      uint64_t usablePerChannel =
++          static_cast<uint64_t>(chipDesc.getUsableDramChannelSize());
++      uint64_t numChannels =
++          static_cast<uint64_t>(chipDesc.getNumDramChannels());
++      dramBudgetOpt = usablePerChannel * numChannels;
++      return WalkResult::interrupt();
++    });
++
++    if (!dramBudgetOpt.has_value()) {
++      return; // CPU-only compile -- no device info, skip.
++    }
++
++    const uint64_t dramBudgetBytes = *dramBudgetOpt;
++    const uint64_t warnThreshold =
++        static_cast<uint64_t>(static_cast<double>(dramBudgetBytes) * 0.90);
++
++    // ------------------------------------------------------------------
++    // 2. Per-function freelist simulation
++    // ------------------------------------------------------------------
++    moduleOp->walk([&](func::FuncOp funcOp) {
++      // One freelist per function.  For symmetric SPMD the per-chip IR
++      // already reflects per-chip tensor sizes, so one simulation suffices.
++      FreeListAllocator allocator(dramBudgetBytes);
++
++      // Maps each live tensor Value to its simulated DRAM base address so
++      // we can return the correct range to the freelist on deallocation.
++      llvm::DenseMap<Value, uint64_t> tensorBase;
++
++      // Failure state
++      bool failed = false;
++      Operation *failingOp = nullptr;
++      uint64_t failingRequestBytes = 0;
++      bool isFragmentationOOM = false;
++
++      // For the 90% warning path we still track peak high-water mark.
++      uint64_t peakUsedBytes = 0;
++      Operation *peakOp = nullptr;
++
++      // ---- allocValue: first-fit alloc for a single tensor Value ---- //
++      auto allocValue = [&](Value val, Operation *op) {
++        uint64_t rawBytes = getDRAMTensorBytes(val);
++        if (rawBytes == 0)
++          return; // not a DRAM tensor -- nothing to track
++
++        uint64_t bytes = alignUp(rawBytes);
++        std::optional<uint64_t> base = allocator.allocate(bytes);
++
++        if (!base.has_value()) {
++          if (!failed) {
++            // Record the first failure; distinguish fragmentation from total
++            // budget overflow by checking whether there is enough total free
++            // memory but no single contiguous block of the required size.
++            isFragmentationOOM = allocator.totalFreeBytes() >= bytes;
++            failed = true;
++            failingOp = op;
++            failingRequestBytes = bytes;
++          }
++          return;
++        }
++
++        tensorBase[val] = *base;
++        uint64_t usedNow = dramBudgetBytes - allocator.totalFreeBytes();
++        if (usedNow > peakUsedBytes) {
++          peakUsedBytes = usedNow;
++          peakOp = op;
++        }
++      };
++
++      // ---- freeValue: return a tensor's range to the freelist ---- //
++      auto freeValue = [&](Value val) {
++        uint64_t rawBytes = getDRAMTensorBytes(val);
++        if (rawBytes == 0)
++          return;
++        auto it = tensorBase.find(val);
++        if (it == tensorBase.end())
++          return; // allocation failed earlier -- nothing to free
++        allocator.free(it->second, alignUp(rawBytes));
++        tensorBase.erase(it);
++      };
++
++      // ---- Function arguments: weights / inputs, permanently live ---- //
++      for (BlockArgument arg : funcOp.getArguments())
++        allocValue(arg, funcOp.getBody().front().getTerminator());
++
++      // ---- Walk all ops in program order ---- //
++      funcOp.walk([&](Operation *op) {
++        if (auto deallocOp = mlir::dyn_cast<DeallocateOp>(op)) {
++          freeValue(deallocOp.getInput());
++          return;
++        }
++        for (Value result : op->getResults())
++          allocValue(result, op);
++      });
++
++      // ---- Emit diagnostics ---- //
++      const uint64_t peakMiB = peakUsedBytes / (1024ULL * 1024);
++      const uint64_t budgetMiB = dramBudgetBytes / (1024ULL * 1024);
++
++      if (failed) {
++        InFlightDiagnostic diag =
++            failingOp ? failingOp->emitError() : funcOp->emitError();
++
++        if (isFragmentationOOM) {
++          // The allocator had enough total free bytes but no single
++          // contiguous block large enough -- this is the Mochi 10B /
++          // seq_len=2080 failure mode.
++          const uint64_t largestMiB =
++              allocator.largestFreeBlock() / (1024ULL * 1024);
++          const uint64_t totalFreeMiB =
++              allocator.totalFreeBytes() / (1024ULL * 1024);
++          const uint64_t requestMiB = failingRequestBytes / (1024ULL * 1024);
++
++          diag << "[TTNNCheckDRAMBudget] Fragmentation-induced DRAM OOM "
++               << "detected at compile time.\n"
++               << "  Requested contiguous block: " << requestMiB << " MiB\n"
++               << "  Largest available free block: " << largestMiB
++               << " MiB (total free: " << totalFreeMiB
++               << " MiB / " << budgetMiB << " MiB)\n\n"
++               << "  The allocator has enough total free DRAM but cannot "
++               << "find a contiguous region.\n"
++               << "  This means the model will hang silently at runtime.\n\n"
++               << "  Fixes:\n"
++               << "  1. Enable SDPA fusion (--enable-fusing) to eliminate "
++               << "O(n^2) QK^T buffers\n"
++               << "  2. Use XLA rematerialization: "
++               << "XLA_FLAGS='--xla_rematerialization=true'\n"
++               << "  3. Reduce sequence length or batch size";
++        } else {
++          // Classic total-budget OOM.
++          diag << "[TTNNCheckDRAMBudget] Estimated peak DRAM usage "
++               << peakMiB << " MiB exceeds per-chip DRAM budget "
++               << budgetMiB << " MiB. "
++               << "This model will hang silently at runtime.\n"
++               << "  Possible fixes:\n"
++               << "  1. Enable SDPA fusion: --enable-fusing (eliminates "
++               << "O(n^2) attention buffers)\n"
++               << "  2. Reduce sequence length below the OOM threshold\n"
++               << "  3. Reduce batch size\n"
++               << "  4. Use opt_level=0 (lower memory overhead, slower "
++               << "compute)\n"
++               << "  5. Use XLA rematerialization: "
++               << "XLA_FLAGS='--xla_rematerialization=true'";
++        }
++        signalPassFailure();
++      } else if (peakUsedBytes > warnThreshold) {
++        (peakOp ? peakOp->emitWarning() : funcOp->emitWarning())
++            << "[TTNNCheckDRAMBudget] Estimated peak DRAM usage "
++            << peakMiB << " MiB is "
++            << (peakUsedBytes * 100 / dramBudgetBytes)
++            << "% of per-chip budget (" << budgetMiB
++            << " MiB). Risk of DRAM OOM or fragmentation at larger "
++            << "sequence lengths.";
++      }
++    });
++  }
++};
++
++} // namespace mlir::tt::ttnn
+-- 
+2.34.1
+

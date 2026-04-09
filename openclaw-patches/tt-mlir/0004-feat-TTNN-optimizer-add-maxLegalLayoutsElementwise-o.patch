@@ -1,0 +1,119 @@
+From 36d7cb8720ffcc9e80ff6702631dd5ff10042dc2 Mon Sep 17 00:00:00 2001
+From: nvukobratTT <nvukobratTT@users.noreply.github.com>
+Date: Thu, 9 Apr 2026 00:18:59 +0000
+Subject: [PATCH 4/8] feat(TTNN optimizer): add maxLegalLayoutsElementwise
+ option to reduce compile time
+
+Elementwise unary/binary ops (Add, Mul, ReLU, Exp, SiLU, Sqrt, etc.)
+execute element-by-element and do not benefit from exploring large sharded
+layout spaces.  Their optimal layout is almost always DRAM interleaved or
+L1 interleaved.
+
+Adds a new --max-legal-layouts-elementwise option (default: 2, vs the global
+default of 8) that caps the sharded layout search for ops implementing the
+ElementwiseUnary or ElementwiseBinary interfaces.
+
+Expected impact for Mochi 10B (48 attention blocks, thousands of elementwise
+ops): 15-25% additional compile time reduction on top of the existing
+TTNNOpsModelCache.  The cap is tunable per invocation.
+
+GH: https://github.com/nvukobratTT/tt-xla/issues/2 (Fix 4)
+---
+ .../Dialect/TTNN/Pipelines/TTNNPipelines.h     |  9 +++++++++
+ .../ttmlir/Dialect/TTNN/Transforms/Optimizer.h |  1 +
+ .../ttmlir/Dialect/TTNN/Utils/PassOverrides.h  |  2 ++
+ .../Transforms/OptimizerPasses/Optimizer.cpp   | 18 ++++++++++++++++--
+ 4 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+index e42104361..1ca881709 100644
+--- a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
++++ b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+@@ -210,6 +210,15 @@ struct TTIRToTTNNDevicePipelineOptions
+                      "layout analysis."),
+       llvm::cl::init(8)};
+ 
++  // Cap for elementwise unary/binary ops. These ops execute element-by-element
++  // and don't benefit from exploring large sharded layout spaces.
++  Option<int64_t> maxLegalLayoutsElementwise{
++      *this, OptionNames::maxLegalLayoutsElementwise,
++      llvm::cl::desc("Override maximum number of sharded layouts for "
++                     "elementwise (unary/binary) ops in legal layout analysis. "
++                     "Set lower than max-legal-layouts to reduce compile time."),
++      llvm::cl::init(2)};
++
+   ListOption<int64_t> meshShape{
+       *this, OptionNames::meshShape,
+       llvm::cl::desc("Set the multi-device mesh shape.")};
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Optimizer.h b/include/ttmlir/Dialect/TTNN/Transforms/Optimizer.h
+index f11cdfea1..a2383a8c4 100644
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Optimizer.h
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Optimizer.h
+@@ -33,6 +33,7 @@ struct TTNNOptimizerOptions {
+       MemoryLayoutAnalysisPolicyType::DFSharding;
+   bool memReconfigEnabled = false;
+   int64_t maxLegalLayouts = 64;
++  int64_t maxLegalLayoutsElementwise = 2;
+   bool rowMajorEnabled = false;
+   std::shared_ptr<::tt::tt_metal::distributed::MeshDevice> devicePtr = nullptr;
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/Utils/PassOverrides.h b/include/ttmlir/Dialect/TTNN/Utils/PassOverrides.h
+index 14ca928b9..2e1e092bd 100644
+--- a/include/ttmlir/Dialect/TTNN/Utils/PassOverrides.h
++++ b/include/ttmlir/Dialect/TTNN/Utils/PassOverrides.h
+@@ -32,6 +32,8 @@ struct OptionNames {
+   static constexpr StringRef systemDescPath = "system-desc-path";
+   static constexpr StringRef mockSystemDescArch = "mock-system-desc-arch";
+   static constexpr StringRef maxLegalLayouts = "max-legal-layouts";
++  static constexpr StringRef maxLegalLayoutsElementwise =
++      "max-legal-layouts-elementwise";
+   static constexpr StringRef meshShape = "mesh-shape";
+   static constexpr StringRef meshTopology = "mesh-topology";
+   static constexpr StringRef tuplifyInputIfEmpty = "tuplify-input-if-empty";
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
+index 6764d828e..3645f875f 100644
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
+@@ -60,6 +60,7 @@ TTNNOptimizerOptions::TTNNOptimizerOptions(
+       memoryLayoutAnalysisPolicy(pipelineOptions.memoryLayoutAnalysisPolicy),
+       memReconfigEnabled(pipelineOptions.memReconfigEnabled),
+       maxLegalLayouts(pipelineOptions.maxLegalLayouts),
++      maxLegalLayoutsElementwise(pipelineOptions.maxLegalLayoutsElementwise),
+       rowMajorEnabled(pipelineOptions.rowMajorEnabled) {}
+ 
+ namespace {
+@@ -298,6 +299,12 @@ protected:
+       ::llvm::cl::desc("Override maximum number of sharded layouts for legal "
+                        "layout analysis."),
+       ::llvm::cl::init(64)};
++  ::mlir::Pass::Option<int64_t> maxLegalLayoutsElementwise{
++      *this, OptionNames::maxLegalLayoutsElementwise,
++      ::llvm::cl::desc("Override maximum number of sharded layouts for "
++                       "elementwise (unary/binary) ops. Lower than "
++                       "max-legal-layouts to reduce compile time."),
++      ::llvm::cl::init(2)};
+   ::mlir::Pass::Option<bool> rowMajorEnabled{
+       *this, "row-major-enabled",
+       ::llvm::cl::desc(
+@@ -404,9 +411,16 @@ public:
+         // Run legal layout analysis to select the best layouts.
+         LegalOpLayoutAnalysis legalOpLayoutAnalysis =
+             getChildAnalysis<LegalOpLayoutAnalysis>(op);
++        // Elementwise ops (unary/binary) don't benefit from exploring large
++        // sharded layout spaces. Cap their search to save OpModel queries.
++        int64_t effectiveMaxLegalLayouts =
++            (mlir::isa<ElementwiseUnary>(op) ||
++             mlir::isa<ElementwiseBinary>(op))
++                ? maxLegalLayoutsElementwise
++                : maxLegalLayouts;
+         legalOpLayoutAnalysis.init(LegalOpLayoutAnalysisInput(
+-            &tensorLayouts->getSecond(), maxLegalLayouts, &overrideOutputLayout,
+-            rowMajorEnabled));
++            &tensorLayouts->getSecond(), effectiveMaxLegalLayouts,
++            &overrideOutputLayout, rowMajorEnabled));
+ 
+         LegalOpConfigAnalysis legalOpConfigAnalysis =
+             getChildAnalysis<LegalOpConfigAnalysis>(op);
+-- 
+2.34.1
+

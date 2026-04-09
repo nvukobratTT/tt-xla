@@ -1,0 +1,91 @@
+From 73c27b47e6785a087c4cf0b01c2e16d279e13dd9 Mon Sep 17 00:00:00 2001
+From: nvukobratTT <nvukobratTT@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 23:50:59 +0000
+Subject: [PATCH 3/8] =?UTF-8?q?fix(StableHLO=E2=86=92TTIR):=20fix=20PadOp?=
+ =?UTF-8?q?=20interior-padding=20index=20order=20(row-major)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+StableHLOToTTIROpPadOpConversionPattern converts stablehlo.pad with
+interior padding by computing flat 1D scatter indices, then calling
+flattenTensor on the source, and scattering source elements into a FullOp
+tensor.
+
+Bug: the index enumeration loop started from current_index=0 (outermost
+dimension), producing indices in column-major order. flattenTensor uses
+row-major order (last dimension fastest). The mismatch placed source
+elements at wrong positions — 95%+ of elements misplaced in a 2D RoPE
+repro (max error 14.6×).
+
+Fix: replace the hand-rolled carry loop with a recursive row-major
+enumeration (innermost dimension varies fastest), matching the flattening
+order.
+
+Impact: fixes all models using out[..., 0::2] = val strided assignment
+(RoPE), including Wan2.1-T2V, Flux, LLaMA, Mistral, SD3.
+
+Fixes: https://github.com/nvukobratTT/tt-xla/issues/5
+---
+ .../StableHLOToTTIRPatterns.cpp               | 43 ++++++++-----------
+ 1 file changed, 18 insertions(+), 25 deletions(-)
+
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index e97cfc36b..847a53ca0 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5600,33 +5600,26 @@ public:
+         lowerbounds.push_back(counter);
+       }
+       llvm::SmallVector<int64_t> flatIndices;
+-      flatIndices.append(counters.begin(), counters.end());
+-      int64_t numIndices = 1;
+-
+-      size_t current_index = 0;
+-      while (current_index < counters.size() &&
+-             counters[counters.size() - 1] <
+-                 upperbounds[upperbounds.size() - 1]) {
+-        counters[current_index] += steps[current_index];
+-        bool reset = false;
+-        while (current_index < counters.size() &&
+-               counters[current_index] >= upperbounds[current_index]) {
+-          counters[current_index] = lowerbounds[current_index];
+-          current_index++;
+-          if (current_index < counters.size()) {
+-            counters[current_index] += steps[current_index];
+-          }
+-          reset = true;
+-        }
+-        if (current_index >= counters.size()) {
+-          break;
++      int64_t numIndices = 0;
++
++      // Enumerate indices in row-major order (innermost dimension varies
++      // fastest) so the order matches how flattenTensor linearizes the source
++      // tensor. The previous outermost-first iteration produced column-major
++      // index order, which mismatched the row-major-flattened update tensor and
++      // placed source elements at wrong output positions.
++      // See: https://github.com/nvukobratTT/tt-xla/issues/5
++      std::function<void(int64_t)> enumerate = [&](int64_t dim) {
++        if (static_cast<size_t>(dim) == counters.size()) {
++          flatIndices.append(counters.begin(), counters.end());
++          numIndices++;
++          return;
+         }
+-        if (reset) {
+-          current_index = 0;
++        for (counters[dim] = lowerbounds[dim];
++             counters[dim] < upperbounds[dim]; counters[dim] += steps[dim]) {
++          enumerate(dim + 1);
+         }
+-        flatIndices.append(counters.begin(), counters.end());
+-        numIndices++;
+-      }
++      };
++      enumerate(0);
+       auto inputType =
+           mlir::cast<RankedTensorType>(adaptor.getOperand().getType());
+ 
+-- 
+2.34.1
+

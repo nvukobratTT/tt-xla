@@ -1,0 +1,48 @@
+From 64021a52dba117d56401d5cd740eaa457e9c1fc1 Mon Sep 17 00:00:00 2001
+From: nvukobratTT <nvukobratTT@users.noreply.github.com>
+Date: Thu, 9 Apr 2026 00:33:17 +0000
+Subject: [PATCH 6/8] fix(TTNN): exclude SDPA ops from LegalOpLayoutAnalysis
+ optimizer target
+
+ScaledDotProductAttention kernels control their output memory layout
+internally. When the optimizer runs after SDPA fusion, LegalOpLayoutAnalysis
+treats ScaledDotProductAttentionOp as a valid target and may reassign its
+output layout. The SDPA kernel then writes in its native format but downstream
+ops see a different layout tag, producing incorrect results (tt-mlir #5283).
+
+Fix: return false from isValidAnalysisTarget for ScaledDotProductAttentionOp,
+ScaledDotProductAttentionDecodeOp, and PagedScaledDotProductAttentionDecodeOp.
+The optimizer still optimizes their inputs via to_layout insertions.
+
+This is a prerequisite for enabling SDPA fusion with the optimizer active,
+which reduces peak DRAM from O(n^2) to O(n) for attention ops (GH #2, #11).
+
+Upstream tracking: https://github.com/nvukobratTT/tt-xla/issues/2
+---
+ lib/Dialect/TTNN/Analysis/LegalOpLayoutAnalysis.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/lib/Dialect/TTNN/Analysis/LegalOpLayoutAnalysis.cpp b/lib/Dialect/TTNN/Analysis/LegalOpLayoutAnalysis.cpp
+index 6ac72c9bb..d8e9e970b 100644
+--- a/lib/Dialect/TTNN/Analysis/LegalOpLayoutAnalysis.cpp
++++ b/lib/Dialect/TTNN/Analysis/LegalOpLayoutAnalysis.cpp
+@@ -147,6 +147,16 @@ bool LegalOpLayoutAnalysis::isValidAnalysisTarget(Operation *op) {
+   if (llvm::isa<mlir::tt::ttnn::EmptyOp>(op)) {
+     return false;
+   }
++  // ScaledDotProductAttention kernels control their output memory layout
++  // internally. Letting the optimizer override it causes a layout mismatch:
++  // kernel writes in its native format, but downstream ops see different
++  // layout metadata -> incorrect results (golden failure, tt-mlir #5283).
++  // The optimizer still handles input layout transitions via to_layout ops.
++  if (llvm::isa<mlir::tt::ttnn::ScaledDotProductAttentionOp>(op) ||
++      llvm::isa<mlir::tt::ttnn::ScaledDotProductAttentionDecodeOp>(op) ||
++      llvm::isa<mlir::tt::ttnn::PagedScaledDotProductAttentionDecodeOp>(op)) {
++    return false;
++  }
+   return true;
+ }
+ 
+-- 
+2.34.1
+

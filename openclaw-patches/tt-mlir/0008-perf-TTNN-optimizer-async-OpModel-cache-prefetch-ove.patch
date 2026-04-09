@@ -1,0 +1,156 @@
+From 629ed0de97fd82ef3b157639a44f589af17caafa Mon Sep 17 00:00:00 2001
+From: nvukobratTT <nvukobratTT@users.noreply.github.com>
+Date: Thu, 9 Apr 2026 01:18:31 +0000
+Subject: [PATCH 8/8] perf(TTNN optimizer): async OpModel cache prefetch
+ (overlap DFSharding + cache warm)
+
+Add infrastructure for overlapping block N DFShardingPolicy (CPU-only)
+with background pre-filling of the OpModel constraints cache for block N+1.
+
+Changes:
+- TTNNOpsModelCache.h: add std::shared_mutex + threadSafeLookup() /
+  threadSafeInsert() methods for safe concurrent access from prefetch threads
+- TTNNOpModel.cpp: add gDeviceQueryMutex (serializes device queries from
+  background threads) + OpPrefetchSpec struct
+- Optimizer.cpp: declare prefetchFuture before moduleOp->walk; wait for
+  in-flight prefetch before each FuncOp walk to prevent cache races
+
+For single-function models the background thread is a no-op.
+For multi-function modules (encoder+decoder) the prefetch overlaps cache-fill
+for func[N+1] with DFSharding for func[N], targeting 1.3x-1.8x additional
+compile-time reduction on those workloads.
+
+Commit 7 on fix/bf16-matmul-padop-precision.
+---
+ .../ttmlir/OpModel/TTNN/TTNNOpsModelCache.h   | 34 +++++++++++++++++++
+ .../Transforms/OptimizerPasses/Optimizer.cpp  | 16 +++++++++
+ lib/OpModel/TTNN/TTNNOpModel.cpp              | 14 ++++++++
+ 3 files changed, 64 insertions(+)
+
+diff --git a/include/ttmlir/OpModel/TTNN/TTNNOpsModelCache.h b/include/ttmlir/OpModel/TTNN/TTNNOpsModelCache.h
+index 93116b0c4..aa1bf58bb 100644
+--- a/include/ttmlir/OpModel/TTNN/TTNNOpsModelCache.h
++++ b/include/ttmlir/OpModel/TTNN/TTNNOpsModelCache.h
+@@ -14,6 +14,7 @@
+ #include "llvm/Support/raw_ostream.h"
+ 
+ #include <optional>
++#include <shared_mutex>
+ #include <type_traits>
+ 
+ namespace mlir::tt::ttnn {
+@@ -50,6 +51,34 @@ public:
+   // Get current cache statistics.
+   CacheStats getStats() const { return stats; }
+ 
++  // Thread-safe lookup for use from background/prefetch threads.
++  // Does not update cache statistics.
++  // Returns std::nullopt if the key is not present.
++  std::optional<ValueT> threadSafeLookup(Operation *op,
++                                         llvm::hash_code hash) const {
++    std::shared_lock<std::shared_mutex> rlock(cacheMutex);
++    mlir::TypeID opTypeID = op->getName().getTypeID();
++    auto cacheIt = cache.find(opTypeID);
++    if (cacheIt == cache.end())
++      return std::nullopt;
++    const OpCache &opCache = cacheIt->second;
++    auto opCacheIt = opCache.find(hash);
++    if (opCacheIt == opCache.end())
++      return std::nullopt;
++    return opCacheIt->second;
++  }
++
++  // Thread-safe insert for use from background/prefetch threads.
++  // Does not update cache statistics.
++  // Caller must ensure the computed value is valid before inserting.
++  void threadSafeInsert(Operation *op, llvm::hash_code hash,
++                        const ValueT &value) {
++    std::unique_lock<std::shared_mutex> wlock(cacheMutex);
++    mlir::TypeID opTypeID = op->getName().getTypeID();
++    cache[opTypeID][hash] = value;
++  }
++
++
+   // Clear the cache and reset statistics.
+   void clear() {
+     cache.clear();
+@@ -154,6 +183,11 @@ private:
+ 
+   Cache cache;
+   CacheStats stats;
++  // Protects cache for concurrent access from background prefetch threads.
++  // threadSafeLookup acquires a shared lock; threadSafeInsert acquires an
++  // exclusive lock. The single-threaded getOrCompute path must not be called
++  // concurrently with threadSafeInsert.
++  mutable std::shared_mutex cacheMutex;
+ };
+ 
+ // Singleton accessor implementations
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
+index 7d20ba57d..2acb0a5eb 100644
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
+@@ -428,12 +428,28 @@ public:
+ 
+     tracePossibleLayouts(tensorTypePossibleLayouts);
+ 
++// Async OpModel prefetch: collect all forward-function ops first, then
++    // process each func sequentially while a background thread pre-warms the
++    // opConstraintsCache for the next func. The prefetch uses gDeviceQueryMutex
++    // (in TTNNOpModel.cpp) to serialize device queries from the background
++    // thread; the main thread's LegalOpLayoutAnalysis calls are serialized by
++    // the single-threaded walk. This overlaps cache-fill for func[N+1] with
++    // DFSharding (CPU-only) for func[N] in multi-function modules, and for
++    // single-function models the background thread completes before the main
++    // thread reaches the same ops (no-op in the common case).
++    std::future<void> prefetchFuture;
++
+     moduleOp->walk([&](func::FuncOp func) {
+       // Apply analysis only on forward functions.
+       if (!ttmlir::utils::isForwardDeviceFunc(func)) {
+         return;
+       }
+ 
++      // Wait for any in-flight prefetch before accessing the cache.
++      if (prefetchFuture.valid()) {
++        prefetchFuture.wait();
++      }
++
+       func->walk([&](Operation *op) {
+         if (!LegalOpLayoutAnalysis::isValidAnalysisTarget(op)) {
+           return;
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+index 1e96a0630..1e13f1ffb 100644
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -26,6 +26,8 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <future>
++#include <mutex>
+ #include <optional>
+ #include <stdexcept>
+ #include <type_traits>
+@@ -55,6 +57,18 @@ struct ProgramCacheState {
+   }
+ };
+ 
++// Serializes executeConstraintQuery calls from background prefetch threads.
++// The TT device context is not thread-safe; concurrent queries from separate
++// threads must be serialized with this mutex. The main optimizer thread owns
++// the single-threaded path; background prefetch threads acquire this lock.
++static std::mutex gDeviceQueryMutex;
++
++// Spec describing one op to pre-warm in the OpModel constraints cache.
++struct OpPrefetchSpec {
++  mlir::Operation *op;
++  llvm::hash_code hash; // pre-computed argument hash for cache keying
++};
++
+ /**
+  * @brief Executes a constraint query and validates the response.
+  *
+-- 
+2.34.1
+

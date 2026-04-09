@@ -1,0 +1,81 @@
+From 27751fbd45db8d603edebfa007252d764f8206dd Mon Sep 17 00:00:00 2001
+From: nvukobratTT <nvukobratTT@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 23:50:59 +0000
+Subject: [PATCH 2/8] fix(TTNN): propagate packer_l1_acc when fp32_dest_acc_en
+ is set
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When fp32_dest_acc_en is enabled, TTNN defaults packer_l1_acc=true for
+bf16 ops via init_device_compute_kernel_config(). However, when tt-xla
+builds an explicit DeviceComputeKernelConfigAttr, it only sets
+packerL1Acc if the option is explicitly true, effectively overriding the
+TTNN default and disabling L1 packing precision.
+
+Fix: Mirror the TTNN default — enable packerL1Acc whenever fp32DestAccEn
+is set in TTNNSetComputeKernelConfig options.
+
+Additionally, fix TTNNToFlatbuffer.cpp to serialize compute_config for
+LinearOp (MatmulWithBiasFusionPattern produces LinearOp from matmul+add).
+Without this serialization, fp32_dest_acc_en and packer_l1_acc are
+silently dropped for bias-fused matmuls at the flatbuffer boundary.
+
+Fixes: https://github.com/nvukobratTT/tt-xla/issues/1
+---
+ lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp | 12 ++++++++++++
+ lib/Target/TTNN/TTNNToFlatbuffer.cpp         | 13 ++++++++++++-
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+index aedb3178a..dc55e7d58 100644
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -324,6 +324,18 @@ void createTTIRToTTNNDevicePipeline(
+     setConfigOptions.mathFidelity = options.computeCfgMathFidelity.getValue();
+     setConfigOptions.fp32DestAccEn = options.computeCfgFp32DestAccEn.getValue();
+ 
++    // When fp32_dest_acc_en is true, also enable packer_l1_acc.
++    // Without this, the explicit DeviceComputeKernelConfigAttr built by
++    // tt-xla disables the L1 packing precision that TTNN's
++    // init_device_compute_kernel_config() enables by default for bf16 ops
++    // (default_l1_acc = !is_float_32). TTNNSetComputeKernelConfig.cpp only
++    // sets packerL1Acc when the option is explicitly true, so we must mirror
++    // the TTNN default here.
++    // See: https://github.com/nvukobratTT/tt-xla/issues/1
++    if (setConfigOptions.fp32DestAccEn) {
++      setConfigOptions.packerL1Acc = true;
++    }
++
+     if (setConfigOptions.fp32DestAccEn ||
+         setConfigOptions.mathFidelity != OptionalMathFidelity::Undefined) {
+       devicePm.addPass(createTTNNSetComputeKernelConfig(setConfigOptions));
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+index fbc84b2bf..3becc247e 100644
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -559,9 +559,20 @@ createOp(FlatbufferObjectCache &cache, LinearOp op) {
+   }
+ 
+   auto activation = toFlatbuffer(cache, op.getActivation()).value_or(0);
++
++  // Serialize compute_config — same as MatmulOp.
++  // Without this, when MatmulWithBiasFusionPattern fires (matmul+add → LinearOp),
++  // fp32_dest_acc_en and packer_l1_acc settings are silently dropped at the
++  // flatbuffer boundary, causing precision regression vs plain matmul.
++  // See: https://github.com/nvukobratTT/tt-xla/issues/1
++  std::optional<
++      ::flatbuffers::Offset<::tt::target::ttnn::DeviceComputeKernelConfig>>
++      computeConfig = toFlatbuffer(cache, op.getComputeConfig());
++
+   return ::tt::target::ttnn::CreateLinearOp(
+       *cache.fbb, a, b, bias, output, op.getTransposeA(), op.getTransposeB(),
+-      matmulProgramConfigType, matmulProgramConfigDesc, activation);
++      matmulProgramConfigType, matmulProgramConfigDesc, activation,
++      computeConfig.value_or(0));
+ }
+ 
+ // ANCHOR: adding_an_op_matmul_serialize_to_binary
+-- 
+2.34.1
+

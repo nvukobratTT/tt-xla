@@ -1,0 +1,47 @@
+--- a/third_party/tt-mlir/src/tt-mlir/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/third_party/tt-mlir/src/tt-mlir/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5601,27 +5601,28 @@ class StableHLOToTTIROpPadOpConversionPattern
+       llvm::SmallVector<int64_t> flatIndices;
+       flatIndices.append(counters.begin(), counters.end());
+       int64_t numIndices = 1;
+ 
+-      size_t current_index = 0;
+-      while (current_index < counters.size() &&
+-             counters[counters.size() - 1] <
+-                 upperbounds[upperbounds.size() - 1]) {
+-        counters[current_index] += steps[current_index];
+-        bool reset = false;
+-        while (current_index < counters.size() &&
+-               counters[current_index] >= upperbounds[current_index]) {
+-          counters[current_index] = lowerbounds[current_index];
+-          current_index++;
+-          if (current_index < counters.size()) {
+-            counters[current_index] += steps[current_index];
++      // Iterate in row-major order (innermost dimension varies fastest) so
++      // that the enumerated multi-dim indices match the row-major flattening
++      // of the source tensor performed by flattenTensor() below.  The
++      // original column-major loop (current_index starting at 0) mismatched
++      // that flattening and placed source elements at wrong output positions.
++      while (true) {
++        // Advance innermost dimension and carry toward outer dimensions.
++        int64_t cur = static_cast<int64_t>(counters.size()) - 1;
++        counters[cur] += steps[cur];
++        while (cur >= 0 && counters[cur] >= upperbounds[cur]) {
++          counters[cur] = lowerbounds[cur];
++          cur--;
++          if (cur >= 0) {
++            counters[cur] += steps[cur];
+           }
+-          reset = true;
+         }
+-        if (current_index >= counters.size()) {
++        // Outermost dimension overflowed: all source positions enumerated.
++        if (cur < 0) {
+           break;
+         }
+-        if (reset) {
+-          current_index = 0;
+-        }
+         flatIndices.append(counters.begin(), counters.end());
+         numIndices++;
+       }

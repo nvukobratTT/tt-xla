@@ -1,0 +1,22 @@
+--- a/third_party/tt-mlir/src/tt-mlir/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/third_party/tt-mlir/src/tt-mlir/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -321,9 +321,16 @@ class TTNNSetComputeKernelConfig
+     TTNNSetComputeKernelConfigOptions setConfigOptions;
+ 
+     // Forward the OptionalMathFidelity value directly
+     setConfigOptions.mathFidelity = options.computeCfgMathFidelity.getValue();
+     setConfigOptions.fp32DestAccEn = options.computeCfgFp32DestAccEn.getValue();
+ 
++    // When fp32_dest_acc_en is true, also enable packer_l1_acc.
++    // Without this, tt-xla's explicit DeviceComputeKernelConfigAttr disables the
++    // L1 packing precision that TTNN's init_device_compute_kernel_config()
++    // applies by default for bf16 ops (default_l1_acc = !is_float_32).
++    // See: TTNNSetComputeKernelConfig.cpp — the pass only sets packerL1Acc if
++    // the option is true, and TTNNToFlatbuffer.cpp propagates it to runtime.
++    if (setConfigOptions.fp32DestAccEn) {
++      setConfigOptions.packerL1Acc = true;
++    }
++
+     if (setConfigOptions.fp32DestAccEn ||
+         setConfigOptions.mathFidelity != OptionalMathFidelity::Undefined) {
+       devicePm.addPass(createTTNNSetComputeKernelConfig(setConfigOptions));
