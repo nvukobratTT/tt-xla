@@ -25,6 +25,86 @@ import torch_xla.runtime as xr
 from torch_xla.distributed.spmd import Mesh
 
 
+# =============================================================================
+# TT SDPA Attention Processor — O(seq) memory vs O(seq^2) with standard SDPA
+# =============================================================================
+
+def _compute_seq_len_1_3b(height: int, width: int, num_frames: int) -> int:
+    frames = (num_frames - 1) // 4 + 1
+    h_patches = height // 16
+    w_patches = width // 16
+    return frames * h_patches * w_patches
+
+
+def is_sdpa_compatible_1_3b(height: int, width: int, num_frames: int) -> bool:
+    return _compute_seq_len_1_3b(height, width, num_frames) % 32 == 0
+
+
+class WanTTSDPAAttnProcessor:
+    """TT-native SDPA for 1.3B (same logic as 14B, handles 3 heads/chip)."""
+
+    def __call__(
+        self, attn, hidden_states, encoder_hidden_states=None,
+        attention_mask=None, rotary_emb=None,
+    ):
+        from tt_torch.custom_ops import scaled_dot_product_attention as tt_sdpa
+        from diffusers.models.transformers.transformer_wan import _get_qkv_projections
+
+        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        query = query.unflatten(2, (attn.heads, -1))
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+        if rotary_emb is not None:
+            def apply_rotary_emb(x, freqs_cos, freqs_sin):
+                x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
+                cos = freqs_cos[..., 0::2]
+                sin = freqs_sin[..., 1::2]
+                out = torch.empty_like(x)
+                out[..., 0::2] = x1 * cos - x2 * sin
+                out[..., 1::2] = x1 * sin + x2 * cos
+                return out.type_as(x)
+            query = apply_rotary_emb(query, *rotary_emb)
+            key = apply_rotary_emb(key, *rotary_emb)
+
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+
+        q_seq = query.shape[2]
+        assert q_seq % 32 == 0, f"seq_len={q_seq} not divisible by 32"
+
+        hidden_states = tt_sdpa(query, key, value, is_causal=False)
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).type_as(query)
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+
+def apply_tt_sdpa_to_transformer_1_3b(transformer, height: int, width: int, num_frames: int):
+    from diffusers.models.transformers.transformer_wan import WanAttnProcessor
+    seq_len = _compute_seq_len_1_3b(height, width, num_frames)
+    if seq_len % 32 != 0:
+        print(f"  WARNING: TT SDPA skipped: seq_len={seq_len} not divisible by 32.")
+        return False
+    tt_proc = WanTTSDPAAttnProcessor()
+    n_replaced = 0
+    for block in transformer.blocks:
+        if isinstance(block.attn1.processor, WanAttnProcessor):
+            block.attn1.set_processor(tt_proc)
+            n_replaced += 1
+        if isinstance(block.attn2.processor, WanAttnProcessor):
+            block.attn2.set_processor(tt_proc)
+            n_replaced += 1
+    print(f"  TT SDPA: replaced {n_replaced} attention processors")
+    print(f"    seq={seq_len} ({seq_len//32}x32), O(seq) attention enabled")
+    return True
+
+
+
 def export_to_video(frames: np.ndarray, output_path: str, fps: int = 16):
     try:
         from diffusers.utils import export_to_video as diffusers_export
@@ -266,6 +346,8 @@ class WanT2V1_3BTPPipeline:
         print("  Applying tensor-parallel sharding...")
         apply_tp_sharding_1_3b(self.transformer, self.mesh)
         patch_transformer_with_tp(self.transformer, self.mesh)
+        print("  Applying TT SDPA fusion...")
+        apply_tt_sdpa_to_transformer_1_3b(self.transformer, self.height, self.width, self.num_frames)
 
         print(f"Models loaded and sharded in {time.time() - start:.1f}s")
 
