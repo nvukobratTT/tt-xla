@@ -597,11 +597,15 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
         # mismatch seq/N. All-gather here to get [B, seq, dim] on each chip before
         # the final modulation + reshape.
         if _sp_mode:
-            # xm.all_gather gathers seq-sharded [B, seq/N, dim] → [B, seq, dim] per chip.
-            # Cannot use xs.mark_sharding here because the existing annotation must be
-            # cleared first ("Existing annotation must be cleared first: type: OTHER").
-            hidden_states = xm.all_gather(hidden_states, dim=1)
-            xm.mark_step()
+            # xs.clear_sharding materializes the seq-sharded tensor to CPU (triggers
+            # an all-gather sync), giving the full [B, seq, dim] logical tensor on CPU.
+            # We then move it back to the TT device as a fresh unsharded tensor.
+            # Cannot use xs.mark_sharding to go to replicated because the existing
+            # SPMD annotation ("type: OTHER" tile sharding) must be cleared first and
+            # XLA's mark_sharding raises: "Existing annotation must be cleared first".
+            xm.mark_step()  # flush current graph before CPU transfer
+            hidden_states = xs.clear_sharding(hidden_states)  # CPU, full [B, seq, dim]
+            hidden_states = hidden_states.to(dtype=torch.bfloat16, device=tt_device)
 
         temb = temb.to(dtype=torch.bfloat16, device=tt_device)
         if temb.ndim == 3:
