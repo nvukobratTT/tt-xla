@@ -592,6 +592,14 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
             print(f"      Block {i+1}/{len(self.blocks)} done ({block_time:.1f}s)", flush=True)
 
         # === Phase 4: Output projection ===
+        # In SP mode, hidden_states is [B, seq/N, dim] (seq-sharded).
+        # norm_out uses temb [B, seq, dim] for shift/scale — full-seq broadcast would
+        # mismatch seq/N. All-gather here to get [B, seq, dim] on each chip before
+        # the final modulation + reshape.
+        if _sp_mode:
+            xs.mark_sharding(hidden_states, mesh, (None, None, None))  # all-gather seq
+            xm.mark_step()
+
         temb = temb.to(dtype=torch.bfloat16, device=tt_device)
         if temb.ndim == 3:
             shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
