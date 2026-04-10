@@ -145,6 +145,16 @@ public:
   // Closes currently opened mesh device and submesh device, if any.
   void closeMeshDevice();
 
+  // Returns true if the device has encountered a fatal, unrecoverable error
+  // (e.g. DRAM OOM during execution). Subsequent execute() calls will fail
+  // immediately without attempting to submit to the broken device.
+  bool hasFatalDeviceError() const { return m_has_fatal_device_error; }
+
+  // Marks the device as having a fatal error. Called by execute() when
+  // tt::runtime::submit fails. Once set, cannot be cleared — the process
+  // must be restarted and tt-smi -r run to recover the device.
+  void setFatalDeviceError() { m_has_fatal_device_error = true; }
+
   // Returns the optimizer submesh device of the provided shape. If there is
   // already opened optimizer submesh and its shape matches the provided shape,
   // it is returned. Otherwise, we close any previously opened optimizer submesh
@@ -226,6 +236,11 @@ private:
 
   // Optimizer submesh device (created from m_parent_mesh for optimizer passes).
   std::optional<tt::runtime::Device> m_optimizer_submesh;
+
+  // Set to true when the device enters an unrecoverable error state (e.g. DRAM
+  // OOM during tt::runtime::submit). Once set, subsequent execute() calls fail
+  // fast rather than re-submitting to the broken device.
+  bool m_has_fatal_device_error = false;
 
   // Used to identify the platform.
   const std::string m_platform_name = "tt";

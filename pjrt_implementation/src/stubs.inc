@@ -79,12 +79,8 @@
   // https://github.com/tenstorrent/tt-xla/issues/496
   _STUB(PJRT_Executable_GetCompiledMemoryStats);
 
-  // Deserialization of our executable is not yet supported.
-  // https://github.com/tenstorrent/tt-xla/issues/498
-  _STUB(PJRT_Executable_DeserializeAndLoad);
-
-  // Designed to override already serialized options, but since deserialization
-  // is not yet supported, there is no benefit to implementing this yet.
+  // Designed to override already serialized options. Currently stubbed;
+  // see PJRT_Executable_DeserializeAndLoad for the implemented counterpart.
   _STUB(PJRT_Executable_GetCompileOptions);
   // ---------------------------------------------------------------------------
 

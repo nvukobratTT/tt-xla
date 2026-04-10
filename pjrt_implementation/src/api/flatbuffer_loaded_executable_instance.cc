@@ -194,6 +194,17 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
   DLOG_F(LOG_DEBUG, "FlatbufferLoadedExecutableInstance::Execute");
   LOG_BRINGUP_STAGE("RUNTIME_EXECUTION_START");
 
+  // Fail fast if a previous execution left the device in a fatal error state.
+  // The device cannot be recovered within this process; the user must run
+  // `tt-smi -r <device_ids>` and restart the process.
+  if (m_client_instance->hasFatalDeviceError()) {
+    LOG_F(ERROR,
+          "Device is in an unrecoverable error state from a previous "
+          "execution failure. Run 'tt-smi -r <device_ids>' and restart "
+          "the process to recover.");
+    return tt_pjrt_status::kInternal;
+  }
+
   if (args->num_devices != m_executable_image->getNumDevicesToUtilize()) {
     LOG_F(ERROR, "Device count mismatch: %zu vs %zu", args->num_devices,
           m_executable_image->getNumDevicesToUtilize());
@@ -239,7 +250,23 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
                                   program_index, input_tensors);
 
   if (!r) {
-    m_client_instance->closeMeshDevice();
+    // Do NOT call closeMeshDevice() here.
+    //
+    // When tt::runtime::submit throws (e.g. device DRAM OOM), the exception
+    // propagates through the PJRT stack. For SPMD multi-chip execution, the
+    // ethernet cores involved in the all-reduce are stuck waiting for data
+    // that never arrives. Calling closeMeshDevice() at this point will block
+    // indefinitely waiting for those stuck cores to drain.
+    //
+    // Instead: mark the device as fatally broken, log a clear message, and
+    // return kInternal immediately so JAX/XLA raises a Python exception.
+    m_client_instance->setFatalDeviceError();
+    LOG_F(ERROR,
+          "tt::runtime::submit failed — possible causes: device DRAM OOM "
+          "(increase sequence length limit or reduce batch size), hardware "
+          "fault, or compiler/runtime mismatch. Device is now in an "
+          "unrecoverable state. Run 'tt-smi -r <device_ids>' and restart "
+          "the process to recover.");
     return tt_pjrt_status::kInternal;
   }
 
