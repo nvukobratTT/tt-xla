@@ -201,6 +201,181 @@ def apply_tt_sdpa_to_transformer(transformer, height: int, width: int, num_frame
     return True
 
 
+
+
+# =============================================================================
+# Ulysses Sequence Parallel attention processor
+# =============================================================================
+
+class WanUlyssesAttnProcessor:
+    """
+    DeepSpeed-Ulysses-style Sequence Parallel attention for Wan2.1 transformer.
+
+    Strategy vs head-TP:
+      head-TP: FFN sees full seq=32,760 → SliceOp DRAM OOM at seq > 13,440
+      Ulysses SP: FFN sees seq/N per chip → 4× DRAM reduction → fits within ceiling
+
+    Each device holds [B, seq/N, dim] throughout FFN and non-attention layers.
+    Two all-to-all ops per attention block (via SPMD mark_sharding reshuffle):
+      1. Before SDPA: [B, seq/N, heads, d] → [B, heads/N, seq, d]  per device
+      2. After SDPA:  [B, heads/N, seq, d] → [B, seq/N, heads, d]  per device
+
+    SDPA padding: 480×832 81f has seq=32,760 (not 32-aligned).
+      Pads to 32,768 (+8 tokens) for TT SDPA, trims output after.
+
+    Cross-attention: Q is seq-sharded; encoder K/V are replicated (T5 seq=512).
+      Q: all-to-all → head-sharded [B, heads/N, seq, d]
+      K/V: static head partition [B, heads/N, T5_seq, d]  (no communication)
+    """
+
+    def __init__(self, mesh, num_devices: int, full_seq_len: int):
+        self.mesh = mesh
+        self.num_devices = num_devices
+        self.full_seq_len = full_seq_len
+        self.pad_len = (32 - full_seq_len % 32) % 32
+        self.padded_seq = full_seq_len + self.pad_len
+        if self.pad_len > 0:
+            print(
+                f"  [Ulysses] seq={full_seq_len} not 32-aligned; "
+                f"padding to {self.padded_seq} for TT SDPA"
+            )
+        else:
+            print(f"  [Ulysses] seq={full_seq_len} is 32-aligned — no padding")
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        rotary_emb=None,
+    ):
+        import torch.nn.functional as F
+        from tt_torch.custom_ops import scaled_dot_product_attention as tt_sdpa
+        from diffusers.models.transformers.transformer_wan import _get_qkv_projections
+
+        is_cross_attn = encoder_hidden_states is not None
+
+        # ── QKV projections ───────────────────────────────────────────────────
+        # hidden_states: [B, seq/N, inner_dim]  (seq-sharded)
+        # encoder_hidden_states: [B, T5_seq, inner_dim]  (replicated, cross-attn only)
+        # Weights are replicated; SPMD propagates seq-sharding through matmul.
+        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        # Unflatten: [..., heads, head_dim]
+        query = query.unflatten(2, (attn.heads, -1))   # [B, seq/N, heads, head_dim]
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+        # Apply RoPE (self-attention only; seq/N slice of freqs matches seq/N of Q/K)
+        if rotary_emb is not None:
+            def apply_rotary_emb(x, freqs_cos, freqs_sin):
+                x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
+                cos = freqs_cos[..., 0::2]
+                sin = freqs_sin[..., 1::2]
+                out = torch.empty_like(x)
+                out[..., 0::2] = x1 * cos - x2 * sin
+                out[..., 1::2] = x1 * sin + x2 * cos
+                return out.type_as(x)
+            query = apply_rotary_emb(query, *rotary_emb)
+            key = apply_rotary_emb(key, *rotary_emb)
+
+        # ── ALL-TO-ALL 1: seq-sharding → head-sharding ────────────────────────
+        # Q is [B, seq/N, heads, head_dim] sharded on dim-1.
+        # Transpose → [B, heads, seq/N, head_dim] sharded on dim-2.
+        # Re-annotating dim-1 as 'model' tells SPMD we want head-sharding:
+        # XLA inserts all-to-all → each device gets [B, heads/N, seq, head_dim].
+
+        xs.mark_sharding(query, self.mesh, (None, "model", None, None))
+        query = query.transpose(1, 2)                    # [B, heads, seq/N, head_dim]
+        xs.mark_sharding(query, self.mesh, (None, "model", None, None))
+        # Now per device: [B, heads/N, seq, head_dim]
+
+        if not is_cross_attn:
+            xs.mark_sharding(key, self.mesh, (None, "model", None, None))
+            key = key.transpose(1, 2)
+            xs.mark_sharding(key, self.mesh, (None, "model", None, None))
+
+            xs.mark_sharding(value, self.mesh, (None, "model", None, None))
+            value = value.transpose(1, 2)
+            xs.mark_sharding(value, self.mesh, (None, "model", None, None))
+        else:
+            # Cross-attention: K/V from replicated encoder — partition across heads
+            # (static slice, no all-to-all needed)
+            key = key.transpose(1, 2)                    # [B, heads, T5_seq, head_dim]
+            xs.mark_sharding(key, self.mesh, (None, "model", None, None))
+            # → [B, heads/N, T5_seq, head_dim] per device
+
+            value = value.transpose(1, 2)
+            xs.mark_sharding(value, self.mesh, (None, "model", None, None))
+
+        # ── TT SDPA ───────────────────────────────────────────────────────────
+        q_seq = query.shape[2]   # full_seq_len after all-to-all
+
+        if self.pad_len > 0:
+            query = F.pad(query, (0, 0, 0, self.pad_len))
+            if not is_cross_attn:
+                key = F.pad(key, (0, 0, 0, self.pad_len))
+                value = F.pad(value, (0, 0, 0, self.pad_len))
+            # Cross-attn: only Q is padded; K/V have T5_seq (no padding needed)
+
+        hidden_states_out = tt_sdpa(query, key, value, is_causal=False)
+
+        if self.pad_len > 0:
+            hidden_states_out = hidden_states_out[:, :, :q_seq, :]   # trim padding
+
+        # ── ALL-TO-ALL 2: head-sharding → seq-sharding ────────────────────────
+        # [B, heads/N, seq, head_dim] sharded on dim-1.
+        # Transpose → [B, seq, heads/N, head_dim] sharded on dim-2.
+        # Re-annotating dim-1 → SPMD all-to-all back to seq-sharding.
+        # Result per device: [B, seq/N, heads, head_dim]
+
+        hidden_states_out = hidden_states_out.transpose(1, 2)  # [B, seq, heads/N, head_dim]
+        xs.mark_sharding(hidden_states_out, self.mesh, (None, "model", None, None))
+        # → [B, seq/N, heads, head_dim] per device
+
+        # ── Flatten + output projection ───────────────────────────────────────
+        hidden_states_out = hidden_states_out.flatten(2, 3)    # [B, seq/N, inner_dim]
+        hidden_states_out = hidden_states_out.type_as(query)
+        hidden_states_out = attn.to_out[0](hidden_states_out)  # [B, seq/N, inner_dim]
+        hidden_states_out = attn.to_out[1](hidden_states_out)
+        return hidden_states_out
+
+
+def apply_ulysses_to_transformer(transformer, mesh, num_devices, height: int, width: int, num_frames: int):
+    """
+    Replace WanAttnProcessor with WanUlyssesAttnProcessor on all blocks.
+
+    Call AFTER model load (no weight sharding in SP mode — weights are replicated).
+    seq_len is the full logical sequence. Per-chip seq for FFN = seq_len / num_devices.
+    TT SDPA runs on full seq per chip after the all-to-all (heads/N per chip).
+    """
+    from diffusers.models.transformers.transformer_wan import WanAttnProcessor
+
+    seq_len = _compute_seq_len(height, width, num_frames)
+    seq_per_chip = seq_len // num_devices
+
+    pad_len = (32 - seq_len % 32) % 32
+    print(f"  [Ulysses SP] seq={seq_len} | seq/chip (FFN)={seq_per_chip} "
+          f"| SDPA seq={seq_len}+{pad_len}={seq_len+pad_len} | heads/chip={40 // num_devices}")
+
+    proc = WanUlyssesAttnProcessor(mesh, num_devices, seq_len)
+    n_replaced = 0
+    for block in transformer.blocks:
+        if isinstance(block.attn1.processor, WanAttnProcessor):
+            block.attn1.set_processor(proc)
+            n_replaced += 1
+        if isinstance(block.attn2.processor, WanAttnProcessor):
+            block.attn2.set_processor(proc)
+            n_replaced += 1
+
+    print(f"  [Ulysses SP] replaced {n_replaced} attention processors")
+    return proc
+
+
 def apply_tp_sharding_wan_block(block, mesh, num_devices):
     """
     Apply Megatron-style tensor parallel sharding to a single WanTransformerBlock.
@@ -265,13 +440,18 @@ def apply_tp_sharding_wan_block(block, mesh, num_devices):
     return shard_specs
 
 
-def apply_tp_sharding_wan_transformer(transformer, mesh, num_devices):
+def apply_tp_sharding_wan_transformer(transformer, mesh, num_devices, sp_mode=False):
     """
     Apply tensor-parallel sharding to all 40 blocks of the WanTransformer3DModel.
     
     The pre-processing modules (patch_embedding, condition_embedder, rope) stay on CPU
     and are not sharded. Only the transformer blocks + final norm/proj are sharded.
     """
+    if sp_mode:
+        # Ulysses SP: no weight sharding — weights are replicated, activation (seq) is sharded
+        print("  SP mode: weight sharding skipped (seq-parallel activations instead)")
+        return {}
+
     all_specs = {}
 
     for i, block in enumerate(transformer.blocks):
@@ -286,7 +466,7 @@ def apply_tp_sharding_wan_transformer(transformer, mesh, num_devices):
     return all_specs
 
 
-def patch_transformer_with_tp(transformer, mesh, num_devices):
+def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
     """
     Monkey-patch the WanTransformer3DModel forward for TP execution:
     1. Pre-processing on CPU (rope, patch_embedding, condition_embedder)
@@ -365,18 +545,39 @@ def patch_transformer_with_tp(transformer, mesh, num_devices):
         else:
             rotary_emb = rotary_emb.to(dtype=torch.bfloat16, device=tt_device)
 
-        # Mark inputs as replicated (not sharded) — SPMD will handle the sharded matmuls
-        xs.mark_sharding(hidden_states, mesh, (None, None, None))
-        xs.mark_sharding(encoder_hidden_states, mesh, (None, None, None))
-        if timestep_proj.ndim == 3:
-            xs.mark_sharding(timestep_proj, mesh, (None, None, None))
-        elif timestep_proj.ndim == 4:
-            xs.mark_sharding(timestep_proj, mesh, (None, None, None, None))
-        # rotary_emb: mark each tensor in tuple as replicated
-        if isinstance(rotary_emb, (tuple, list)):
-            for r in rotary_emb:
-                spec = tuple(None for _ in range(r.ndim))
-                xs.mark_sharding(r, mesh, spec)
+        # Sharding strategy depends on mode:
+        #   head-TP:  all inputs replicated  → SPMD handles sharded matmuls (head-parallel)
+        #   Ulysses SP: hidden_states seq-sharded → seq/N per device for FFN
+        _sp_mode = getattr(forward_with_tp, "__sp_mode__", False)
+        if _sp_mode:
+            # Seq-sharded: hidden_states [B, seq, dim] → [B, seq/N, dim] per device
+            xs.mark_sharding(hidden_states, mesh, (None, "model", None))
+            # Encoder (cross-attn KV) stays replicated (T5 seq small)
+            xs.mark_sharding(encoder_hidden_states, mesh, (None, None, None))
+            # Timestep replicated (broadcasts over seq/N in LayerNorm modulation)
+            if timestep_proj.ndim == 3:
+                xs.mark_sharding(timestep_proj, mesh, (None, None, None))
+            elif timestep_proj.ndim == 4:
+                xs.mark_sharding(timestep_proj, mesh, (None, None, None, None))
+            # RoPE freqs: seq-sharded so each device has the matching seq/N slice
+            if isinstance(rotary_emb, (tuple, list)):
+                for r in rotary_emb:
+                    # freqs_cos/sin: [1, seq, 1, head_dim_part] → shard dim-1 (seq)
+                    if r.ndim >= 2:
+                        spec = (None, "model") + tuple(None for _ in range(r.ndim - 2))
+                        xs.mark_sharding(r, mesh, spec)
+        else:
+            # Head-TP: mark inputs as replicated — SPMD handles the sharded matmuls
+            xs.mark_sharding(hidden_states, mesh, (None, None, None))
+            xs.mark_sharding(encoder_hidden_states, mesh, (None, None, None))
+            if timestep_proj.ndim == 3:
+                xs.mark_sharding(timestep_proj, mesh, (None, None, None))
+            elif timestep_proj.ndim == 4:
+                xs.mark_sharding(timestep_proj, mesh, (None, None, None, None))
+            if isinstance(rotary_emb, (tuple, list)):
+                for r in rotary_emb:
+                    spec = tuple(None for _ in range(r.ndim))
+                    xs.mark_sharding(r, mesh, spec)
 
         xm.mark_step()
 
@@ -417,12 +618,14 @@ def patch_transformer_with_tp(transformer, mesh, num_devices):
 
         return Transformer2DModelOutput(sample=output)
 
+    # Store sp_mode for the forward closure
+    forward_with_tp.__sp_mode__ = sp_mode
     transformer.forward = types.MethodType(forward_with_tp, transformer)
     print(f"  Patched transformer forward with TP + graph breaks ({len(transformer.blocks)} blocks)")
 
 
 class WanT2VTPConfig:
-    """Configuration for Wan2.1-T2V pipeline with tensor parallelism."""
+    """Configuration for Wan2.1-T2V pipeline with tensor parallelism or sequence parallelism."""
 
     def __init__(
         self,
@@ -430,12 +633,14 @@ class WanT2VTPConfig:
         height: int = 480,
         width: int = 832,
         num_frames: int = 81,
+        seq_parallel: bool = False,
     ):
         self.model_id = model_id
         self.height = height
         self.width = width
         self.num_frames = num_frames
-        self.use_tt_sdpa = True  # use TT fused SDPA when seq_len % 32 == 0
+        self.use_tt_sdpa = True   # use TT fused SDPA when seq_len % 32 == 0
+        self.seq_parallel = seq_parallel  # Ulysses SP: seq-sharded activations
 
 
 class WanT2VTPPipeline:
@@ -527,14 +732,24 @@ class WanT2VTPPipeline:
         print("  Applying tensor-parallel sharding...")
         apply_tp_sharding_wan_transformer(self.transformer, self.mesh, self.num_devices)
 
-        # Apply TT SDPA processors (if seq_len is 32-aligned)
-        if getattr(self.config, 'use_tt_sdpa', True):
-            apply_tt_sdpa_to_transformer(
-                self.transformer, self.config.height, self.config.width, self.config.num_frames
+        # Apply attention processors and patch forward
+        sp_mode = getattr(self.config, "seq_parallel", False)
+        if sp_mode:
+            # Ulysses SP: install Ulysses attn processors (handles all-to-all + SDPA)
+            print("  Using Ulysses Sequence Parallelism (SP) mode")
+            apply_ulysses_to_transformer(
+                self.transformer, self.mesh, self.num_devices,
+                self.config.height, self.config.width, self.config.num_frames,
             )
+        else:
+            # Head-TP: apply TT SDPA processors (if seq_len is 32-aligned)
+            if getattr(self.config, "use_tt_sdpa", True):
+                apply_tt_sdpa_to_transformer(
+                    self.transformer, self.config.height, self.config.width, self.config.num_frames
+                )
 
         # Patch forward for CPU pre-processing + graph breaks
-        patch_transformer_with_tp(self.transformer, self.mesh, self.num_devices)
+        patch_transformer_with_tp(self.transformer, self.mesh, self.num_devices, sp_mode=sp_mode)
 
         elapsed = time.time() - start
         print(f"Models loaded and sharded in {elapsed:.1f}s")
@@ -718,6 +933,7 @@ def run_wan_tp_pipeline(
     output_path: str = "output_video_tp.mp4",
     optimization_level: int = 1,
     use_tt_sdpa: bool = True,
+    seq_parallel: bool = False,
 ):
     """Run the Wan T2V pipeline with tensor parallelism."""
     torch_xla.set_custom_compile_options({"optimization_level": optimization_level})
@@ -726,6 +942,7 @@ def run_wan_tp_pipeline(
         height=height,
         width=width,
         num_frames=num_frames,
+        seq_parallel=seq_parallel,
     )
     config.use_tt_sdpa = use_tt_sdpa
     pipeline = WanT2VTPPipeline(config)
@@ -785,6 +1002,10 @@ if __name__ == "__main__":
     parser.add_argument("--optimization_level", type=int, default=1)
     parser.add_argument("--no_tt_sdpa", action="store_true",
                         help="Disable TT fused SDPA (fall back to F.scaled_dot_product_attention)")
+    parser.add_argument("--seq-parallel", "--seq_parallel", action="store_true",
+                        help="Use Ulysses Sequence Parallelism instead of head-TP. "
+                             "Reduces per-chip FFN memory from seq to seq/N, enabling larger resolutions. "
+                             "Recommended for 480x832 81f (seq=32,760 -> 8,190/chip for FFN).")
     args = parser.parse_args()
 
     xr.set_device_type("TT")
@@ -807,4 +1028,5 @@ if __name__ == "__main__":
         output_path=output_path,
         optimization_level=args.optimization_level,
         use_tt_sdpa=not args.no_tt_sdpa,
+        seq_parallel=getattr(args, "seq_parallel", False),
     )
