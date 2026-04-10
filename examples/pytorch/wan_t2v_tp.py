@@ -438,6 +438,212 @@ def apply_ulysses_to_transformer(
     return proc
 
 
+# =============================================================================
+# Ring SDPA Attention Processor — distributed SDPA with online softmax
+# =============================================================================
+
+class WanRingSDPAAttnProcessor:
+    """
+    Ring-style Distributed SDPA for Wan2.1 transformer.
+
+    Strategy vs Ulysses SP:
+      Ulysses SP:  all-to-all (seq→head) before SDPA → each chip runs full-seq SDPA
+                   with heads/N heads. Peak QK^T = seq² × heads/N per chip.
+      Ring SDPA:   Q stays seq-sharded (seq/N per chip). K/V are all-gathered
+                   then processed in N chunks with online softmax accumulation.
+                   Peak QK^T per chunk = seq/N × seq/N × heads per chip.
+
+    Memory comparison (480×832 81f, seq=32760, N=4, heads=40):
+      Ulysses (unchunked):  32768² × 10 × 2B = 21.5 GB/chip  → OOM
+      Ulysses (chunk=8192): 8192 × 32768 × 10 × 2B = 5.37 GB/chip → OK
+      Ring SDPA (step/chip): 8192 × 8192 × 40 × 2B = 5.37 GB/chip → OK
+
+    Note: TTNN ring_distributed_scaled_dot_product_attention exists in C++ but
+    is CAUSAL-ONLY (for autoregressive decode). Wan2.1 uses bidirectional
+    attention, so this Python-level ring with online softmax is required.
+
+    Cross-attention: Q is seq-sharded; encoder K/V are replicated (T5 seq≤512).
+      Uses simple SDPA — seq/N × T5_seq cost is trivial, no chunking needed.
+    """
+
+    def __init__(self, mesh, num_devices: int, full_seq_len: int):
+        self.mesh = mesh
+        self.num_devices = num_devices
+        self.full_seq_len = full_seq_len
+        # Chunk K/V into num_devices pieces. Pad full_seq so it divides evenly.
+        # Manual matmul (unlike tt_sdpa) has no seq%32 requirement.
+        remainder = full_seq_len % num_devices
+        self.pad_len = (num_devices - remainder) % num_devices
+        self.padded_seq = full_seq_len + self.pad_len
+        self.chunk_size = self.padded_seq // num_devices
+        peak_gb = 40 * self.chunk_size * self.chunk_size * 2 / 1e9
+        print(
+            f"  [RingSDPA] seq={full_seq_len}+{self.pad_len}={self.padded_seq} "
+            f"| chunk/step={self.chunk_size} | ring_size={num_devices} "
+            f"| peak_QKT≈{peak_gb:.2f} GB/chip "
+            f"(heads=40 × {self.chunk_size}² × 2B)"
+        )
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        rotary_emb=None,
+    ):
+        import torch.nn.functional as F
+        from diffusers.models.transformers.transformer_wan import _get_qkv_projections
+
+        is_cross_attn = encoder_hidden_states is not None
+
+        # ── QKV projections ───────────────────────────────────────────────────
+        # hidden_states: [B, seq/N, inner_dim]  (seq-sharded)
+        # encoder_hidden_states: [B, T5_seq, inner_dim]  (replicated, cross-attn only)
+        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+
+        query = attn.norm_q(query)
+        key   = attn.norm_k(key)
+
+        # Unflatten: [..., heads, head_dim]
+        query = query.unflatten(2, (attn.heads, -1))   # [B, seq/N, heads, head_dim]
+        key   = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+        # Apply RoPE (self-attention only; seq/N RoPE slice already sharded to match Q/K)
+        if rotary_emb is not None:
+            def apply_rotary_emb(x, freqs_cos, freqs_sin):
+                x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
+                cos = freqs_cos[..., 0::2]
+                sin = freqs_sin[..., 1::2]
+                out = torch.empty_like(x)
+                out[..., 0::2] = x1 * cos - x2 * sin
+                out[..., 1::2] = x1 * sin + x2 * cos
+                return out.type_as(x)
+            query = apply_rotary_emb(query, *rotary_emb)
+            key   = apply_rotary_emb(key, *rotary_emb)
+
+        # Transpose: [B, seq/N, heads, head_dim] → [B, heads, seq/N, head_dim]
+        # Q stays seq-sharded on dim-2 throughout — no all-to-all needed.
+        query = query.transpose(1, 2)   # [B, heads, seq/N, head_dim], sharded on dim-2
+        key   = key.transpose(1, 2)     # [B, heads, seq/N, head_dim], sharded on dim-2
+        value = value.transpose(1, 2)   # same
+
+        B, H, Sq, D = query.shape
+        scale = D ** -0.5
+
+        if is_cross_attn:
+            # ── Cross-attention ────────────────────────────────────────────────
+            # K/V from replicated encoder (T5_seq ≤ 512) — no all-gather needed.
+            # Q is seq-sharded: [B, heads, seq/N, head_dim]
+            # K/V replicated:   [B, heads, T5_seq, head_dim]
+            # Simple SDPA (T5_seq is tiny — no memory concern).
+            scores = (query.float() @ key.float().transpose(-2, -1)) * scale
+            attn_weights = torch.softmax(scores, dim=-1).to(query.dtype)
+            hidden_states_out = attn_weights @ value
+            # hidden_states_out: [B, heads, seq/N, head_dim] — seq/N per chip ✓
+
+        else:
+            # ── Self-attention: ring distributed SDPA ─────────────────────────
+            # Step 1: All-gather K and V to get full sequence on each chip.
+            #   clear_sharding removes the seq-shard annotation → XLA inserts
+            #   all-gather → each chip gets [B, heads, seq_full, head_dim].
+            xs.clear_sharding(key)
+            xs.clear_sharding(value)
+
+            # Pad K/V so full_seq divides cleanly into num_devices chunks
+            if self.pad_len > 0:
+                key   = F.pad(key,   (0, 0, 0, self.pad_len))
+                value = F.pad(value, (0, 0, 0, self.pad_len))
+
+            # Step 2: Online softmax ring accumulation (flash-attention style).
+            #   For each ring step i, compute partial attention over K_i/V_i chunk.
+            #   Accumulate using the flash-attention running max/sum update rule.
+            #   Peak QK^T per step: B × H × Sq × chunk_size
+            #   = 1 × 40 × 8190 × 8192 × 2B ≈ 5.37 GB for 81f, N=4  ✓
+            running_out = torch.zeros(B, H, Sq, D,    dtype=torch.float32, device=query.device)
+            running_m   = torch.full((B, H, Sq, 1), float("-inf"), dtype=torch.float32, device=query.device)
+            running_s   = torch.zeros((B, H, Sq, 1), dtype=torch.float32, device=query.device)
+
+            for i in range(self.num_devices):
+                k_chunk = key  [:, :, i * self.chunk_size:(i + 1) * self.chunk_size, :]
+                v_chunk = value[:, :, i * self.chunk_size:(i + 1) * self.chunk_size, :]
+
+                # Attention scores: [B, H, Sq, chunk_size]
+                scores = (query.float() @ k_chunk.float().transpose(-2, -1)) * scale
+
+                # Per-chunk stable softmax components
+                m_i   = scores.amax(dim=-1, keepdim=True)          # [B, H, Sq, 1]
+                exp_i = torch.exp(scores - m_i)                    # [B, H, Sq, chunk]
+                s_i   = exp_i.sum(dim=-1, keepdim=True)            # [B, H, Sq, 1]
+                o_i   = exp_i @ v_chunk.float()                    # [B, H, Sq, D]
+
+                # Flash-attention merge rule
+                m_new         = torch.maximum(running_m, m_i)
+                rescale_old   = torch.exp(running_m - m_new)
+                rescale_chunk = torch.exp(m_i       - m_new)
+
+                running_s   = running_s   * rescale_old + s_i * rescale_chunk
+                running_out = running_out * rescale_old + o_i * rescale_chunk
+                running_m   = m_new
+
+                # Force XLA to execute this ring step before building the next graph.
+                # Without mark_step(), all N steps fuse into one graph and the runtime
+                # allocates N × QK^T intermediates simultaneously — negating the savings.
+                xm.mark_step()
+
+            # Normalize: divide accumulated weighted sum by accumulated denominator
+            hidden_states_out = (running_out / running_s).to(query.dtype)  # [B, H, Sq, D]
+
+        # ── Output: already seq-sharded ───────────────────────────────────────
+        # hidden_states_out: [B, heads, seq/N, head_dim] — seq/N is local
+        # Transpose back and mark seq-sharding so SPMD propagates correctly.
+        hidden_states_out = hidden_states_out.transpose(1, 2)  # [B, seq/N, heads, head_dim]
+        xs.mark_sharding(hidden_states_out, self.mesh, (None, "model", None, None))
+
+        # ── Flatten + output projection ───────────────────────────────────────
+        hidden_states_out = hidden_states_out.flatten(2, 3)       # [B, seq/N, inner_dim]
+        hidden_states_out = hidden_states_out.type_as(query)
+        hidden_states_out = attn.to_out[0](hidden_states_out)
+        hidden_states_out = attn.to_out[1](hidden_states_out)
+        return hidden_states_out
+
+
+def apply_ring_sdpa_to_transformer(
+    transformer, mesh, num_devices,
+    height: int, width: int, num_frames: int,
+):
+    """
+    Replace WanAttnProcessor with WanRingSDPAAttnProcessor on all blocks.
+
+    Ring SDPA: Q stays seq-sharded, K/V all-gathered then chunked for online
+    softmax accumulation. Requires seq-parallel activation sharding (same as
+    Ulysses SP — both activated via the sp_mode flag in patch_transformer_with_tp).
+    """
+    from diffusers.models.transformers.transformer_wan import WanAttnProcessor
+
+    seq_len = _compute_seq_len(height, width, num_frames)
+    seq_per_chip = seq_len // num_devices
+    chunk_size = (seq_len + num_devices - 1) // num_devices
+    peak_gb = 40 * chunk_size * chunk_size * 2 / 1e9
+
+    print(f"  [Ring SDPA] seq={seq_len} | seq/chip={seq_per_chip} "
+          f"| chunk_size={chunk_size} | peak_QKT≈{peak_gb:.2f} GB/chip")
+
+    proc = WanRingSDPAAttnProcessor(mesh, num_devices, seq_len)
+    n_replaced = 0
+    for block in transformer.blocks:
+        if isinstance(block.attn1.processor, WanAttnProcessor):
+            block.attn1.set_processor(proc)
+            n_replaced += 1
+        if isinstance(block.attn2.processor, WanAttnProcessor):
+            block.attn2.set_processor(proc)
+            n_replaced += 1
+
+    print(f"  [Ring SDPA] replaced {n_replaced} attention processors")
+    return proc
+
+
 def apply_tp_sharding_wan_block(block, mesh, num_devices):
     """
     Apply Megatron-style tensor parallel sharding to a single WanTransformerBlock.
@@ -737,6 +943,7 @@ class WanT2VTPConfig:
         num_frames: int = 81,
         seq_parallel: bool = False,
         sdpa_chunk_size: int = 0,
+        ring_sdpa: bool = False,
     ):
         self.model_id = model_id
         self.height = height
@@ -745,6 +952,7 @@ class WanT2VTPConfig:
         self.use_tt_sdpa = True   # use TT fused SDPA when seq_len % 32 == 0
         self.seq_parallel = seq_parallel  # Ulysses SP: seq-sharded activations
         self.sdpa_chunk_size = sdpa_chunk_size  # 0 = no chunking; >0 chunks query seq
+        self.ring_sdpa = ring_sdpa  # Ring SDPA: online-softmax ring instead of Ulysses all-to-all
         self.vae_tiling = False
 
 
@@ -842,7 +1050,17 @@ class WanT2VTPPipeline:
 
         # Apply attention processors and patch forward
         sp_mode = getattr(self.config, "seq_parallel", False)
-        if sp_mode:
+        ring_sdpa = getattr(self.config, "ring_sdpa", False)
+        if ring_sdpa:
+            # Ring SDPA: Q stays seq-sharded, K/V all-gathered + chunked online softmax
+            # Also requires seq-parallel activation sharding (sp_mode=True)
+            print("  Using Ring SDPA mode (Q seq-sharded, K/V all-gather + online softmax)")
+            apply_ring_sdpa_to_transformer(
+                self.transformer, self.mesh, self.num_devices,
+                self.config.height, self.config.width, self.config.num_frames,
+            )
+            sp_mode = True  # Ring SDPA needs seq-parallel activation sharding
+        elif sp_mode:
             # Ulysses SP: install Ulysses attn processors (handles all-to-all + SDPA)
             print("  Using Ulysses Sequence Parallelism (SP) mode")
             apply_ulysses_to_transformer(
@@ -1045,6 +1263,7 @@ def run_wan_tp_pipeline(
     seq_parallel: bool = False,
     sdpa_chunk_size: int = 0,
     vae_tiling: bool = False,
+    ring_sdpa: bool = False,
 ):
     """Run the Wan T2V pipeline with tensor parallelism."""
     torch_xla.set_custom_compile_options({"optimization_level": optimization_level})
@@ -1055,6 +1274,7 @@ def run_wan_tp_pipeline(
         num_frames=num_frames,
         seq_parallel=seq_parallel,
         sdpa_chunk_size=sdpa_chunk_size,
+        ring_sdpa=ring_sdpa,
     )
     config.use_tt_sdpa = use_tt_sdpa
     config.vae_tiling = vae_tiling
@@ -1125,6 +1345,14 @@ if __name__ == "__main__":
                              "with --seq-parallel: drops peak from ~19.5 GB to ~4.6 GB/chip.")
     parser.add_argument("--vae-tiling", action="store_true",
                         help="Enable spatial tiling in VAE decoder to reduce peak memory")
+    parser.add_argument("--ring-sdpa", "--ring_sdpa", action="store_true",
+                        help="Use Ring SDPA: Q stays seq-sharded, K/V all-gathered then "
+                             "processed in N ring steps with online softmax accumulation. "
+                             "Peak QK^T = seq/N * seq/N * heads per chip (5.37 GB for 81f). "
+                             "Enables 81f @ 480x832 (vs 65f ceiling without ring). "
+                             "Implicitly enables seq-parallel activation sharding.")
+    parser.add_argument("--output-video", "--output_video", type=str, default=None,
+                        help="Direct output video path (overrides --output_dir based naming)")
     args = parser.parse_args()
 
     xr.set_device_type("TT")
@@ -1133,7 +1361,9 @@ if __name__ == "__main__":
 
     filename = args.prompt[:50].lower().replace(" ", "_")
     filename = "".join(c if c.isalnum() or c == "_" else "" for c in filename)
-    output_path = os.path.join(args.output_dir, f"{filename}_tp.mp4")
+    default_output_path = os.path.join(args.output_dir, f"{filename}_tp.mp4")
+    # --output-video takes precedence over the auto-generated path
+    output_path = getattr(args, "output_video", None) or default_output_path
 
     run_wan_tp_pipeline(
         prompt=args.prompt,
@@ -1150,4 +1380,5 @@ if __name__ == "__main__":
         seq_parallel=getattr(args, "seq_parallel", False),
         sdpa_chunk_size=getattr(args, "sdpa_chunk_size", 0),
         vae_tiling=getattr(args, "vae_tiling", False),
+        ring_sdpa=getattr(args, "ring_sdpa", False),
     )
