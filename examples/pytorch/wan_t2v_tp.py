@@ -676,6 +676,150 @@ def apply_ring_sdpa_to_transformer(
     return proc
 
 
+
+# =============================================================================
+# CPU SDPA Attention Processor — full attention on host CPU (bypasses XLA SDPA)
+# =============================================================================
+
+class WanCPUSDPAAttnProcessor:
+    """
+    CPU-bridge attention processor for Wan2.1 transformer.
+
+    Strategy: run the entire SDPA on host CPU, bypassing XLA compilation for
+    attention entirely. After mark_step() flushes the QKV+RoPE graph to device,
+    Q/K/V are materialized to CPU (triggering the real all-gather at UMD level),
+    then torch.nn.functional.scaled_dot_product_attention runs on CPU (180 GB RAM),
+    and the result is moved back to the XLA device for the output projection.
+
+    Memory on CPU: [1, 40, 32760, 128] Q/K/V @ bfloat16 = 3x 0.53 GB = 1.6 GB total.
+    CPU SDPA (PyTorch uses efficient attention): no seq^2 intermediate allocation.
+
+    Cross-attention: K/V from replicated encoder (T5 seq<=512) -- trivially small.
+
+    Trade-off vs ring-sdpa: slower step time (CPU SDPA ~2-5s vs device ~0.5s),
+    but ZERO XLA compilation for attention -> no 3h compile wall for 81f.
+    """
+
+    def __init__(self, mesh, num_devices: int, full_seq_len: int):
+        self.mesh = mesh
+        self.num_devices = num_devices
+        self.full_seq_len = full_seq_len
+        q_gb = full_seq_len * 40 * 128 * 2 / 1e9
+        print(
+            f"  [CPU SDPA] seq={full_seq_len} | Q/K/V on CPU each ~{q_gb:.2f} GB | "
+            f"SDPA runs on host (no XLA compilation for attention)"
+        )
+
+    def __call__(
+        self,
+        attn,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        rotary_emb=None,
+    ):
+        import torch.nn.functional as F
+        from diffusers.models.transformers.transformer_wan import _get_qkv_projections
+
+        is_cross_attn = encoder_hidden_states is not None
+
+        # -- QKV projections on XLA device ------------------------------------
+        # hidden_states: [B, seq/N, inner_dim]  (seq-sharded by SP)
+        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+
+        query = attn.norm_q(query)
+        key   = attn.norm_k(key)
+
+        # Unflatten: [..., heads, head_dim]
+        query = query.unflatten(2, (attn.heads, -1))   # [B, seq/N, heads, head_dim]
+        key   = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+        # Apply RoPE on device (seq/N slice for self-attention)
+        if rotary_emb is not None:
+            def apply_rotary_emb(x, freqs_cos, freqs_sin):
+                x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
+                cos = freqs_cos[..., 0::2]
+                sin = freqs_sin[..., 1::2]
+                out = torch.empty_like(x)
+                out[..., 0::2] = x1 * cos - x2 * sin
+                out[..., 1::2] = x1 * sin + x2 * cos
+                return out.type_as(x)
+            query = apply_rotary_emb(query, *rotary_emb)
+            key   = apply_rotary_emb(key, *rotary_emb)
+
+        # -- Flush QKV+RoPE graph, then move to CPU ---------------------------
+        # mark_step() compiles + executes the lazy XLA graph for projections+RoPE.
+        # .to("cpu") triggers a blocking all-gather (seq-sharded -> full seq on CPU).
+        xm.mark_step()
+
+        xla_device = query.device
+        xla_dtype  = query.dtype
+
+        # Transpose for SDPA: [B, seq/N, heads, head_dim] -> [B, heads, seq, head_dim]
+        # (after CPU transfer the all-gather gives full seq)
+        query_cpu = query.to("cpu").transpose(1, 2).float()   # [B, heads, seq, head_dim]
+        key_cpu   = key.to("cpu").transpose(1, 2).float()
+        value_cpu = value.to("cpu").transpose(1, 2).float()
+
+        # -- SDPA on CPU ------------------------------------------------------
+        # PyTorch selects flash_attention / memory_efficient / math backend.
+        # On CPU: memory_efficient (sdp_kernel) or math. No OOM for 32k seq.
+        out_cpu = F.scaled_dot_product_attention(
+            query_cpu, key_cpu, value_cpu, is_causal=False
+        )  # [B, heads, seq, head_dim]
+
+        # -- Move output back to XLA, transpose to seq-sharded format ---------
+        # Transpose: [B, heads, seq, head_dim] -> [B, seq, heads, head_dim]
+        out_xla = out_cpu.to(xla_dtype).to(xla_device)   # whole seq on each chip
+        out_xla = out_xla.transpose(1, 2)                 # [B, seq, heads, head_dim]
+
+        # Re-introduce seq-sharding: mark the seq dim as sharded so SPMD
+        # distributes it across chips (matches the SP FFN expectation).
+        xs.mark_sharding(out_xla, self.mesh, (None, "model", None, None))
+        # After mark_sharding: each chip holds [B, seq/N, heads, head_dim]
+
+        # -- Flatten + output projection --------------------------------------
+        hidden_states_out = out_xla.flatten(2, 3)          # [B, seq/N, inner_dim]
+        hidden_states_out = hidden_states_out.to(xla_dtype)
+        hidden_states_out = attn.to_out[0](hidden_states_out)
+        hidden_states_out = attn.to_out[1](hidden_states_out)
+        return hidden_states_out
+
+
+def apply_cpu_sdpa_to_transformer(
+    transformer, mesh, num_devices,
+    height: int, width: int, num_frames: int,
+):
+    """
+    Replace WanAttnProcessor with WanCPUSDPAAttnProcessor on all blocks.
+
+    CPU SDPA: all attention runs on host CPU after flushing QKV+RoPE to device.
+    Completely bypasses XLA SDPA compilation. Requires seq-parallel activation
+    sharding (sp_mode=True) for FFN layers to stay within DRAM budget.
+    """
+    from diffusers.models.transformers.transformer_wan import WanAttnProcessor
+
+    seq_len = _compute_seq_len(height, width, num_frames)
+    seq_per_chip = seq_len // num_devices
+
+    print(f"  [CPU SDPA] seq={seq_len} | seq/chip (FFN)={seq_per_chip} "
+          f"| SDPA on CPU host (PyTorch flash/efficient backend)")
+
+    proc = WanCPUSDPAAttnProcessor(mesh, num_devices, seq_len)
+    n_replaced = 0
+    for block in transformer.blocks:
+        if isinstance(block.attn1.processor, WanAttnProcessor):
+            block.attn1.set_processor(proc)
+            n_replaced += 1
+        if isinstance(block.attn2.processor, WanAttnProcessor):
+            block.attn2.set_processor(proc)
+            n_replaced += 1
+
+    print(f"  [CPU SDPA] replaced {n_replaced} attention processors")
+    return proc
+
+
 def apply_tp_sharding_wan_block(block, mesh, num_devices):
     """
     Apply Megatron-style tensor parallel sharding to a single WanTransformerBlock.
@@ -976,6 +1120,7 @@ class WanT2VTPConfig:
         seq_parallel: bool = False,
         sdpa_chunk_size: int = 0,
         ring_sdpa: bool = False,
+        cpu_sdpa: bool = False,
     ):
         self.model_id = model_id
         self.height = height
@@ -985,6 +1130,7 @@ class WanT2VTPConfig:
         self.seq_parallel = seq_parallel  # Ulysses SP: seq-sharded activations
         self.sdpa_chunk_size = sdpa_chunk_size  # 0 = no chunking; >0 chunks query seq
         self.ring_sdpa = ring_sdpa  # Ring SDPA: online-softmax ring instead of Ulysses all-to-all
+        self.cpu_sdpa = cpu_sdpa  # CPU SDPA: full attention on CPU host, bypasses XLA compilation
         self.vae_tiling = False
 
 
@@ -1083,7 +1229,17 @@ class WanT2VTPPipeline:
         # Apply attention processors and patch forward
         sp_mode = getattr(self.config, "seq_parallel", False)
         ring_sdpa = getattr(self.config, "ring_sdpa", False)
-        if ring_sdpa:
+        cpu_sdpa = getattr(self.config, "cpu_sdpa", False)
+        if cpu_sdpa:
+            # CPU SDPA: full attention on host CPU, zero XLA compilation for attention
+            # Also requires seq-parallel activation sharding for FFN
+            print("  Using CPU SDPA mode (full attention on host CPU, no XLA SDPA compilation)")
+            apply_cpu_sdpa_to_transformer(
+                self.transformer, self.mesh, self.num_devices,
+                self.config.height, self.config.width, self.config.num_frames,
+            )
+            sp_mode = True  # CPU SDPA needs seq-parallel activation sharding
+        elif ring_sdpa:
             # Ring SDPA: Q stays seq-sharded, K/V all-gathered + chunked online softmax
             # Also requires seq-parallel activation sharding (sp_mode=True)
             print("  Using Ring SDPA mode (Q seq-sharded, K/V all-gather + online softmax)")
@@ -1296,6 +1452,7 @@ def run_wan_tp_pipeline(
     sdpa_chunk_size: int = 0,
     vae_tiling: bool = False,
     ring_sdpa: bool = False,
+    cpu_sdpa: bool = False,
 ):
     """Run the Wan T2V pipeline with tensor parallelism."""
     torch_xla.set_custom_compile_options({"optimization_level": optimization_level})
@@ -1307,6 +1464,7 @@ def run_wan_tp_pipeline(
         seq_parallel=seq_parallel,
         sdpa_chunk_size=sdpa_chunk_size,
         ring_sdpa=ring_sdpa,
+        cpu_sdpa=cpu_sdpa,
     )
     config.use_tt_sdpa = use_tt_sdpa
     config.vae_tiling = vae_tiling
@@ -1383,6 +1541,14 @@ if __name__ == "__main__":
                              "Peak QK^T = seq/N * seq/N * heads per chip (5.37 GB for 81f). "
                              "Enables 81f @ 480x832 (vs 65f ceiling without ring). "
                              "Implicitly enables seq-parallel activation sharding.")
+    parser.add_argument("--cpu-sdpa", "--cpu_sdpa", action="store_true",
+                        help="Use CPU SDPA: full attention runs on host CPU (180 GB RAM), "
+                             "bypassing XLA compilation for SDPA entirely. "
+                             "Enables 81f @ 480x832 with no compile overhead. "
+                             "Implicitly enables seq-parallel activation sharding.")
+    parser.add_argument("--ring-joint-sdpa", "--ring_joint_sdpa", action="store_true",
+                        help="Alias for --cpu-sdpa (TTNN ring_joint SDPA not available; "
+                             "uses CPU SDPA bridge instead).")
     parser.add_argument("--output-video", "--output_video", type=str, default=None,
                         help="Direct output video path (overrides --output_dir based naming)")
     args = parser.parse_args()
@@ -1413,4 +1579,5 @@ if __name__ == "__main__":
         sdpa_chunk_size=getattr(args, "sdpa_chunk_size", 0),
         vae_tiling=getattr(args, "vae_tiling", False),
         ring_sdpa=getattr(args, "ring_sdpa", False),
+        cpu_sdpa=getattr(args, "cpu_sdpa", False) or getattr(args, "ring_joint_sdpa", False),
     )
