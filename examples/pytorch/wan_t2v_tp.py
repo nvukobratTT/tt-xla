@@ -592,20 +592,46 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
             print(f"      Block {i+1}/{len(self.blocks)} done ({block_time:.1f}s)", flush=True)
 
         # === Phase 4: Output projection ===
-        # In SP mode, hidden_states is [B, seq/N, dim] (seq-sharded).
-        # norm_out uses temb [B, seq, dim] for shift/scale — full-seq broadcast would
-        # mismatch seq/N. All-gather here to get [B, seq, dim] on each chip before
-        # the final modulation + reshape.
+        # In SP mode, hidden_states is [B, seq/N, dim] per chip (seq-sharded).
+        # Problem: norm_out uses temb [B, seq, dim] for shift/scale (full-seq),
+        # and the reshape below expects full seq (not seq/N).
+        # Solution: flush TT graph, move to CPU (which materializes the full
+        # logical [B, seq, dim] by all-gathering all shards), run norm+proj+reshape
+        # on CPU, then move the result back to TT device.
+        # This SP-mode CPU detour runs once per block per denoising step (not hot path).
         if _sp_mode:
-            # xs.clear_sharding materializes the seq-sharded tensor to CPU (triggers
-            # an all-gather sync), giving the full [B, seq, dim] logical tensor on CPU.
-            # We then move it back to the TT device as a fresh unsharded tensor.
-            # Cannot use xs.mark_sharding to go to replicated because the existing
-            # SPMD annotation ("type: OTHER" tile sharding) must be cleared first and
-            # XLA's mark_sharding raises: "Existing annotation must be cleared first".
-            xm.mark_step()  # flush current graph before CPU transfer
-            hidden_states = xs.clear_sharding(hidden_states)  # CPU, full [B, seq, dim]
-            hidden_states = hidden_states.to(dtype=torch.bfloat16, device=tt_device)
+            xm.mark_step()  # flush blocks graph first
+            # Moving seq-sharded TT tensor to CPU gives the full logical tensor
+            # (XLA gathers all shards into the global shape on host transfer)
+            hidden_states_cpu = hidden_states.to(device="cpu", dtype=torch.float32)
+            temb_cpu = temb.to(device="cpu", dtype=torch.float32)
+            # Move output modules to CPU temporarily
+            self.norm_out.to("cpu")
+            self.proj_out.to("cpu")
+            if temb_cpu.ndim == 3:
+                sst = self.scale_shift_table.unsqueeze(0).to("cpu").float()
+                shift, scale = (sst + temb_cpu.unsqueeze(2)).chunk(2, dim=2)
+                shift = shift.squeeze(2)
+                scale = scale.squeeze(2)
+            else:
+                sst = self.scale_shift_table.to("cpu").float()
+                shift, scale = (sst + temb_cpu.unsqueeze(1)).chunk(2, dim=1)
+            hidden_states_cpu = (
+                self.norm_out(hidden_states_cpu) * (1 + scale) + shift
+            ).to(torch.bfloat16)
+            hidden_states_cpu = self.proj_out(hidden_states_cpu)
+            # Restore modules to TT device
+            self.norm_out.to(tt_device)
+            self.proj_out.to(tt_device)
+            hidden_states = hidden_states_cpu.reshape(
+                batch_size, post_patch_num_frames, post_patch_height, post_patch_width,
+                p_t, p_h, p_w, -1
+            )
+            hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+            output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+            if not return_dict:
+                return (output,)
+            return Transformer2DModelOutput(sample=output)
 
         temb = temb.to(dtype=torch.bfloat16, device=tt_device)
         if temb.ndim == 3:
@@ -632,7 +658,6 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
             return (output,)
 
         return Transformer2DModelOutput(sample=output)
-
     # Store sp_mode for the forward closure
     forward_with_tp.__sp_mode__ = sp_mode
     transformer.forward = types.MethodType(forward_with_tp, transformer)
