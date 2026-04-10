@@ -597,7 +597,10 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
         # mismatch seq/N. All-gather here to get [B, seq, dim] on each chip before
         # the final modulation + reshape.
         if _sp_mode:
-            xs.mark_sharding(hidden_states, mesh, (None, None, None))  # all-gather seq
+            # xm.all_gather gathers seq-sharded [B, seq/N, dim] → [B, seq, dim] per chip.
+            # Cannot use xs.mark_sharding here because the existing annotation must be
+            # cleared first ("Existing annotation must be cleared first: type: OTHER").
+            hidden_states = xm.all_gather(hidden_states, dim=1)
             xm.mark_step()
 
         temb = temb.to(dtype=torch.bfloat16, device=tt_device)
