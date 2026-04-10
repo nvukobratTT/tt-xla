@@ -565,6 +565,12 @@ class WanRingSDPAAttnProcessor:
                 key   = F.pad(key,   (0, 0, 0, self.pad_len))
                 value = F.pad(value, (0, 0, 0, self.pad_len))
 
+            # Flush all-gather + padding into their own compiled graph before
+            # entering the ring loop.  Without this, Graph 0 combines the
+            # all-gather collective with ring step 0, producing a large fused
+            # graph that tt-mlir can take >120 min to compile.
+            xm.mark_step()
+
             # Step 2: Online softmax ring accumulation (flash-attention style).
             #   For each ring step i, compute partial attention over K_i/V_i chunk.
             #   Accumulate using the flash-attention running max/sum update rule.
