@@ -745,6 +745,7 @@ class WanT2VTPConfig:
         self.use_tt_sdpa = True   # use TT fused SDPA when seq_len % 32 == 0
         self.seq_parallel = seq_parallel  # Ulysses SP: seq-sharded activations
         self.sdpa_chunk_size = sdpa_chunk_size  # 0 = no chunking; >0 chunks query seq
+        self.vae_tiling = False
 
 
 class WanT2VTPPipeline:
@@ -811,6 +812,9 @@ class WanT2VTPPipeline:
             torch_dtype=torch.float32,
         ).to("cpu")
         self.vae.eval()
+        if getattr(self.config, 'vae_tiling', False):
+            self.vae.enable_tiling(tile_sample_min_height=256, tile_sample_min_width=256)
+            print('  VAE tiling enabled (256x256 tiles)')
 
         # 3. Scheduler
         print("  Loading scheduler...")
@@ -1040,6 +1044,7 @@ def run_wan_tp_pipeline(
     use_tt_sdpa: bool = True,
     seq_parallel: bool = False,
     sdpa_chunk_size: int = 0,
+    vae_tiling: bool = False,
 ):
     """Run the Wan T2V pipeline with tensor parallelism."""
     torch_xla.set_custom_compile_options({"optimization_level": optimization_level})
@@ -1052,6 +1057,7 @@ def run_wan_tp_pipeline(
         sdpa_chunk_size=sdpa_chunk_size,
     )
     config.use_tt_sdpa = use_tt_sdpa
+    config.vae_tiling = vae_tiling
     pipeline = WanT2VTPPipeline(config)
     pipeline.load_models()
 
@@ -1117,6 +1123,8 @@ if __name__ == "__main__":
                         help="Split SDPA query into chunks of this size to reduce peak DRAM. "
                              "0 = no chunking (default). 8192 recommended for 77f/81f at 480x832 "
                              "with --seq-parallel: drops peak from ~19.5 GB to ~4.6 GB/chip.")
+    parser.add_argument("--vae-tiling", action="store_true",
+                        help="Enable spatial tiling in VAE decoder to reduce peak memory")
     args = parser.parse_args()
 
     xr.set_device_type("TT")
@@ -1141,4 +1149,5 @@ if __name__ == "__main__":
         use_tt_sdpa=not args.no_tt_sdpa,
         seq_parallel=getattr(args, "seq_parallel", False),
         sdpa_chunk_size=getattr(args, "sdpa_chunk_size", 0),
+        vae_tiling=getattr(args, "vae_tiling", False),
     )
