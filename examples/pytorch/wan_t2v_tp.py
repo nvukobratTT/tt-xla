@@ -215,22 +215,33 @@ def chunked_tt_sdpa(query, key, value, chunk_size: int = 0, is_causal: bool = Fa
     [B, heads, seq_q, seq_k], enabling larger frame counts at 480×832.
 
     Memory math (480×832 Ulysses SP):
-      - 77f (seq=31200): full SDPA = 31200² × 10 × 2B = 19.47 GB → OOM
-      - chunk_size=8192:  peak  = 8192  × 31200 × 10 × 2B =  4.59 GB  ✅
+      - 77f (seq=31200): full SDPA = 31200^2 * 10 * 2B = 19.47 GB -> OOM
+      - chunk_size=8192:  peak  = 8192  * 31200 * 10 * 2B =  4.59 GB  OK
 
-    chunk_size=0 (default): no chunking — full SDPA (original behaviour).
-    XLA traces a fixed unrolled graph (seq_q // chunk_size separate SDPA ops).
+    chunk_size=0 (default): no chunking - full SDPA (original behaviour).
+
+    IMPORTANT: xm.mark_step() is called between chunks to force sequential
+    execution on device. Without this, XLA compiles all N chunks into a single
+    graph and the TT runtime allocates all N x QK^T intermediates simultaneously,
+    negating the memory benefit of chunking entirely.
     """
     from tt_torch.custom_ops import scaled_dot_product_attention as tt_sdpa
 
     seq_q = query.shape[2]
-    if chunk_size <= 0 or seq_q <= chunk_size:
+    seq_k = key.shape[2]
+    # Skip chunking if: disabled, fits in one chunk, or K/V seq is tiny
+    # (cross-attention has seq_k=226 - no benefit to chunking)
+    if chunk_size <= 0 or seq_q <= chunk_size or seq_k <= chunk_size:
         return tt_sdpa(query, key, value, is_causal=is_causal)
 
     chunks = []
     for i in range(0, seq_q, chunk_size):
         q_chunk = query[:, :, i:i + chunk_size, :]
         out_chunk = tt_sdpa(q_chunk, key, value, is_causal=is_causal)
+        # Force XLA to execute this chunk before building the next graph.
+        # Without mark_step(), all N chunk SDPA ops are fused into one graph
+        # and the runtime allocates N x QK^T intermediates simultaneously.
+        xm.mark_step()
         chunks.append(out_chunk)
     return torch.cat(chunks, dim=2)
 
