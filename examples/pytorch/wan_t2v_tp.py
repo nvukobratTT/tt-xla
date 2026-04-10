@@ -466,20 +466,29 @@ class WanRingSDPAAttnProcessor:
       Uses simple SDPA — seq/N × T5_seq cost is trivial, no chunking needed.
     """
 
-    def __init__(self, mesh, num_devices: int, full_seq_len: int):
+    def __init__(self, mesh, num_devices: int, full_seq_len: int, ring_steps: int = 0):
         self.mesh = mesh
         self.num_devices = num_devices
         self.full_seq_len = full_seq_len
-        # Chunk K/V into num_devices pieces. Pad full_seq so it divides evenly.
-        # Manual matmul (unlike tt_sdpa) has no seq%32 requirement.
-        remainder = full_seq_len % num_devices
-        self.pad_len = (num_devices - remainder) % num_devices
+        # Chunk K/V into ring_steps pieces (not necessarily == num_devices).
+        # Auto-select ring_steps to keep chunk_size < 4096, avoiding slow tt-mlir
+        # compiler paths for large-K raw matmuls (TOOLS.md: K>4K gotcha).
+        if ring_steps <= 0:
+            # Auto: smallest N such that ceil(seq/N) < 4096
+            import math
+            ring_steps = max(num_devices, math.ceil(full_seq_len / 4095))
+            # Round up to next multiple of num_devices for even distribution
+            if ring_steps % num_devices != 0:
+                ring_steps = ((ring_steps // num_devices) + 1) * num_devices
+        self.ring_steps = ring_steps
+        remainder = full_seq_len % ring_steps
+        self.pad_len = (ring_steps - remainder) % ring_steps
         self.padded_seq = full_seq_len + self.pad_len
-        self.chunk_size = self.padded_seq // num_devices
+        self.chunk_size = self.padded_seq // ring_steps
         peak_gb = 40 * self.chunk_size * self.chunk_size * 2 / 1e9
         print(
             f"  [RingSDPA] seq={full_seq_len}+{self.pad_len}={self.padded_seq} "
-            f"| chunk/step={self.chunk_size} | ring_size={num_devices} "
+            f"| chunk/step={self.chunk_size} | ring_steps={ring_steps} (devices={num_devices}) "
             f"| peak_QKT≈{peak_gb:.2f} GB/chip "
             f"(heads=40 × {self.chunk_size}² × 2B)"
         )
@@ -565,7 +574,7 @@ class WanRingSDPAAttnProcessor:
             running_m   = torch.full((B, H, Sq, 1), float("-inf"), dtype=torch.float32, device=query.device)
             running_s   = torch.zeros((B, H, Sq, 1), dtype=torch.float32, device=query.device)
 
-            for i in range(self.num_devices):
+            for i in range(self.ring_steps):
                 k_chunk = key  [:, :, i * self.chunk_size:(i + 1) * self.chunk_size, :]
                 v_chunk = value[:, :, i * self.chunk_size:(i + 1) * self.chunk_size, :]
 
@@ -612,6 +621,7 @@ class WanRingSDPAAttnProcessor:
 def apply_ring_sdpa_to_transformer(
     transformer, mesh, num_devices,
     height: int, width: int, num_frames: int,
+    ring_steps: int = 0,
 ):
     """
     Replace WanAttnProcessor with WanRingSDPAAttnProcessor on all blocks.
@@ -630,7 +640,7 @@ def apply_ring_sdpa_to_transformer(
     print(f"  [Ring SDPA] seq={seq_len} | seq/chip={seq_per_chip} "
           f"| chunk_size={chunk_size} | peak_QKT≈{peak_gb:.2f} GB/chip")
 
-    proc = WanRingSDPAAttnProcessor(mesh, num_devices, seq_len)
+    proc = WanRingSDPAAttnProcessor(mesh, num_devices, seq_len, ring_steps=ring_steps)
     n_replaced = 0
     for block in transformer.blocks:
         if isinstance(block.attn1.processor, WanAttnProcessor):
