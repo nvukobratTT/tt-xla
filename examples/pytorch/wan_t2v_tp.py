@@ -234,10 +234,21 @@ def chunked_tt_sdpa(query, key, value, chunk_size: int = 0, is_causal: bool = Fa
     if chunk_size <= 0 or seq_q <= chunk_size or seq_k <= chunk_size:
         return tt_sdpa(query, key, value, is_causal=is_causal)
 
+    # For chunked SDPA, use decomposed matmul+softmax+matmul to avoid
+    # the slow TTNN SDPA CustomCall compilation for asymmetric shapes.
+    # tt.scaled_dot_product_attention with Q_len != K_len (e.g., [8192,32768])
+    # takes 20+ min to compile in tt-mlir; plain XLA HLO matmuls compile in ~10s.
+    # Memory: Q_chunk@K^T = [1,nh,chunk_size,seq_k]*bf16 = same budget as CustomCall.
+    import math as _math
+    _scale = 1.0 / _math.sqrt(query.shape[-1])
     chunks = []
     for i in range(0, seq_q, chunk_size):
         q_chunk = query[:, :, i:i + chunk_size, :]
-        out_chunk = tt_sdpa(q_chunk, key, value, is_causal=is_causal)
+        # [1,nh,chunk,dh] @ [1,nh,dh,seq_k] -> [1,nh,chunk,seq_k]
+        scores = torch.matmul(q_chunk, key.transpose(-2, -1)) * _scale
+        weights = torch.nn.functional.softmax(scores, dim=-1)
+        # [1,nh,chunk,seq_k] @ [1,nh,seq_k,dh] -> [1,nh,chunk,dh]
+        out_chunk = torch.matmul(weights, value)
         # Force XLA to execute this chunk before building the next graph.
         # Without mark_step(), all N chunk SDPA ops are fused into one graph
         # and the runtime allocates N x QK^T intermediates simultaneously.
