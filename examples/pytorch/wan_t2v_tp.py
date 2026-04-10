@@ -204,6 +204,38 @@ def apply_tt_sdpa_to_transformer(transformer, height: int, width: int, num_frame
 
 
 # =============================================================================
+# Chunked SDPA helper (reduces peak DRAM for large frame counts)
+# =============================================================================
+
+def chunked_tt_sdpa(query, key, value, chunk_size: int = 0, is_causal: bool = False):
+    """
+    Chunked SDPA: splits the query sequence into chunks to bound peak DRAM.
+
+    Peak SDPA tensor becomes [B, heads, chunk_size, seq_k] instead of the full
+    [B, heads, seq_q, seq_k], enabling larger frame counts at 480×832.
+
+    Memory math (480×832 Ulysses SP):
+      - 77f (seq=31200): full SDPA = 31200² × 10 × 2B = 19.47 GB → OOM
+      - chunk_size=8192:  peak  = 8192  × 31200 × 10 × 2B =  4.59 GB  ✅
+
+    chunk_size=0 (default): no chunking — full SDPA (original behaviour).
+    XLA traces a fixed unrolled graph (seq_q // chunk_size separate SDPA ops).
+    """
+    from tt_torch.custom_ops import scaled_dot_product_attention as tt_sdpa
+
+    seq_q = query.shape[2]
+    if chunk_size <= 0 or seq_q <= chunk_size:
+        return tt_sdpa(query, key, value, is_causal=is_causal)
+
+    chunks = []
+    for i in range(0, seq_q, chunk_size):
+        q_chunk = query[:, :, i:i + chunk_size, :]
+        out_chunk = tt_sdpa(q_chunk, key, value, is_causal=is_causal)
+        chunks.append(out_chunk)
+    return torch.cat(chunks, dim=2)
+
+
+# =============================================================================
 # Ulysses Sequence Parallel attention processor
 # =============================================================================
 
@@ -228,10 +260,11 @@ class WanUlyssesAttnProcessor:
       K/V: static head partition [B, heads/N, T5_seq, d]  (no communication)
     """
 
-    def __init__(self, mesh, num_devices: int, full_seq_len: int):
+    def __init__(self, mesh, num_devices: int, full_seq_len: int, sdpa_chunk_size: int = 0):
         self.mesh = mesh
         self.num_devices = num_devices
         self.full_seq_len = full_seq_len
+        self.sdpa_chunk_size = sdpa_chunk_size
         self.pad_len = (32 - full_seq_len % 32) % 32
         self.padded_seq = full_seq_len + self.pad_len
         if self.pad_len > 0:
@@ -241,6 +274,13 @@ class WanUlyssesAttnProcessor:
             )
         else:
             print(f"  [Ulysses] seq={full_seq_len} is 32-aligned — no padding")
+        if sdpa_chunk_size > 0:
+            n_chunks = (self.padded_seq + sdpa_chunk_size - 1) // sdpa_chunk_size
+            peak_gb = sdpa_chunk_size * self.padded_seq * 10 * 2 / 1e9
+            print(
+                f"  [Ulysses] chunked SDPA enabled: chunk_size={sdpa_chunk_size}, "
+                f"n_chunks={n_chunks}, peak_SDPA≈{peak_gb:.2f} GB/chip"
+            )
 
     def __call__(
         self,
@@ -322,7 +362,11 @@ class WanUlyssesAttnProcessor:
                 value = F.pad(value, (0, 0, 0, self.pad_len))
             # Cross-attn: only Q is padded; K/V have T5_seq (no padding needed)
 
-        hidden_states_out = tt_sdpa(query, key, value, is_causal=False)
+        hidden_states_out = chunked_tt_sdpa(
+            query, key, value,
+            chunk_size=self.sdpa_chunk_size,
+            is_causal=False,
+        )
 
         if self.pad_len > 0:
             hidden_states_out = hidden_states_out[:, :, :q_seq, :]   # trim padding
@@ -345,13 +389,20 @@ class WanUlyssesAttnProcessor:
         return hidden_states_out
 
 
-def apply_ulysses_to_transformer(transformer, mesh, num_devices, height: int, width: int, num_frames: int):
+def apply_ulysses_to_transformer(
+    transformer, mesh, num_devices,
+    height: int, width: int, num_frames: int,
+    sdpa_chunk_size: int = 0,
+):
     """
     Replace WanAttnProcessor with WanUlyssesAttnProcessor on all blocks.
 
     Call AFTER model load (no weight sharding in SP mode — weights are replicated).
     seq_len is the full logical sequence. Per-chip seq for FFN = seq_len / num_devices.
     TT SDPA runs on full seq per chip after the all-to-all (heads/N per chip).
+
+    sdpa_chunk_size: split query into chunks of this size to bound peak DRAM.
+      0 = no chunking (full SDPA). 8192 reduces 77f peak from 19.47→~4.6 GB/chip.
     """
     from diffusers.models.transformers.transformer_wan import WanAttnProcessor
 
@@ -362,7 +413,7 @@ def apply_ulysses_to_transformer(transformer, mesh, num_devices, height: int, wi
     print(f"  [Ulysses SP] seq={seq_len} | seq/chip (FFN)={seq_per_chip} "
           f"| SDPA seq={seq_len}+{pad_len}={seq_len+pad_len} | heads/chip={40 // num_devices}")
 
-    proc = WanUlyssesAttnProcessor(mesh, num_devices, seq_len)
+    proc = WanUlyssesAttnProcessor(mesh, num_devices, seq_len, sdpa_chunk_size=sdpa_chunk_size)
     n_replaced = 0
     for block in transformer.blocks:
         if isinstance(block.attn1.processor, WanAttnProcessor):
@@ -674,6 +725,7 @@ class WanT2VTPConfig:
         width: int = 832,
         num_frames: int = 81,
         seq_parallel: bool = False,
+        sdpa_chunk_size: int = 0,
     ):
         self.model_id = model_id
         self.height = height
@@ -681,6 +733,7 @@ class WanT2VTPConfig:
         self.num_frames = num_frames
         self.use_tt_sdpa = True   # use TT fused SDPA when seq_len % 32 == 0
         self.seq_parallel = seq_parallel  # Ulysses SP: seq-sharded activations
+        self.sdpa_chunk_size = sdpa_chunk_size  # 0 = no chunking; >0 chunks query seq
 
 
 class WanT2VTPPipeline:
@@ -780,6 +833,7 @@ class WanT2VTPPipeline:
             apply_ulysses_to_transformer(
                 self.transformer, self.mesh, self.num_devices,
                 self.config.height, self.config.width, self.config.num_frames,
+                sdpa_chunk_size=getattr(self.config, "sdpa_chunk_size", 0),
             )
         else:
             # Head-TP: apply TT SDPA processors (if seq_len is 32-aligned)
@@ -974,6 +1028,7 @@ def run_wan_tp_pipeline(
     optimization_level: int = 1,
     use_tt_sdpa: bool = True,
     seq_parallel: bool = False,
+    sdpa_chunk_size: int = 0,
 ):
     """Run the Wan T2V pipeline with tensor parallelism."""
     torch_xla.set_custom_compile_options({"optimization_level": optimization_level})
@@ -983,6 +1038,7 @@ def run_wan_tp_pipeline(
         width=width,
         num_frames=num_frames,
         seq_parallel=seq_parallel,
+        sdpa_chunk_size=sdpa_chunk_size,
     )
     config.use_tt_sdpa = use_tt_sdpa
     pipeline = WanT2VTPPipeline(config)
@@ -1046,6 +1102,10 @@ if __name__ == "__main__":
                         help="Use Ulysses Sequence Parallelism instead of head-TP. "
                              "Reduces per-chip FFN memory from seq to seq/N, enabling larger resolutions. "
                              "Recommended for 480x832 81f (seq=32,760 -> 8,190/chip for FFN).")
+    parser.add_argument("--sdpa_chunk_size", "--sdpa-chunk-size", type=int, default=0,
+                        help="Split SDPA query into chunks of this size to reduce peak DRAM. "
+                             "0 = no chunking (default). 8192 recommended for 77f/81f at 480x832 "
+                             "with --seq-parallel: drops peak from ~19.5 GB to ~4.6 GB/chip.")
     args = parser.parse_args()
 
     xr.set_device_type("TT")
@@ -1069,4 +1129,5 @@ if __name__ == "__main__":
         optimization_level=args.optimization_level,
         use_tt_sdpa=not args.no_tt_sdpa,
         seq_parallel=getattr(args, "seq_parallel", False),
+        sdpa_chunk_size=getattr(args, "sdpa_chunk_size", 0),
     )
