@@ -555,20 +555,36 @@ class WanRingSDPAAttnProcessor:
         else:
             # ── Self-attention: ring distributed SDPA ─────────────────────────
             # Step 1: All-gather K and V to get full sequence on each chip.
-            #   clear_sharding removes the seq-shard annotation → XLA inserts
-            #   all-gather → each chip gets [B, heads, seq_full, head_dim].
-            xs.clear_sharding(key)
-            xs.clear_sharding(value)
+            #
+            # v4 approach: CPU-roundtrip all-gather (outside XLA compiled graph).
+            # xs.clear_sharding() inserts an all-gather collective INTO the XLA
+            # graph, producing a [1,40,seq_full,128] output tensor that tt-mlir
+            # must plan memory for.  For long sequences (seq=26520 for 65f) this
+            # graph takes >60 min to compile.
+            #
+            # Instead: flush the pending lazy graph, then do a blocking CPU
+            # transfer (which triggers the real all-gather at the UMD/mesh level
+            # outside XLA's compiler), and move the result back to device as a
+            # fresh tensor with no collective op in its computation history.
+            # Ring step graphs then contain only: slice + matmul + softmax merge,
+            # which compile quickly.
+            xm.mark_step()  # flush QKV/RoPE graph before host transfer
+            key_dev   = key.device
+            key_dtype = key.dtype
+            # .to("cpu") triggers blocking all-gather: seq-sharded → full seq
+            key_full_cpu   = key.to("cpu")
+            value_full_cpu = value.to("cpu")
+            # Move back to XLA device as a fresh, unsharded (replicated) tensor
+            key   = key_full_cpu.to(key_dev).to(key_dtype)
+            value = value_full_cpu.to(key_dev).to(key_dtype)
 
-            # Pad K/V so full_seq divides cleanly into num_devices chunks
+            # Pad K/V so full_seq divides cleanly into ring_steps chunks
             if self.pad_len > 0:
                 key   = F.pad(key,   (0, 0, 0, self.pad_len))
                 value = F.pad(value, (0, 0, 0, self.pad_len))
 
-            # Flush all-gather + padding into their own compiled graph before
-            # entering the ring loop.  Without this, Graph 0 combines the
-            # all-gather collective with ring step 0, producing a large fused
-            # graph that tt-mlir can take >120 min to compile.
+            # Flush the device-placement graph so ring steps each compile
+            # as their own independent graph (just matmul+softmax merge).
             xm.mark_step()
 
             # Step 2: Online softmax ring accumulation (flash-attention style).
