@@ -1492,7 +1492,7 @@ def run_wan_tp_pipeline(
     cpu_sdpa: bool = False,
 ):
     """Run the Wan T2V pipeline with tensor parallelism."""
-    torch_xla.set_custom_compile_options({"optimization_level": optimization_level})
+    torch_xla.set_custom_compile_options({"optimization_level": optimization_level, "fp32_dest_acc_en": False})
 
     config = WanT2VTPConfig(
         height=height,
