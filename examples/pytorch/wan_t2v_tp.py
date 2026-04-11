@@ -360,15 +360,16 @@ class WanUlyssesAttnProcessor:
         # after the all-to-all, enabling TTNN streaming compute (Flash Attn 2).
         # Padding AFTER RoPE avoids rotary_emb shape mismatch (RoPE uses original seq).
         # Padding BEFORE mark_sharding preserves SPMD sharding annotations.
+        # CROSS-ATTN: skip padding. Q_len x K_len = 32760 x 512 = 333 MB (fits fine).
+        # Asymmetric tt.SDPA with padded Q (32768) and K=512 hangs in tt-mlir (TOOLS.md).
         orig_S = query.shape[1]  # global seq after QKV/RoPE, before padding
         _alignment = 32 * self.num_devices  # 128 for 4-device mesh
-        global_pad = (_alignment - orig_S % _alignment) % _alignment
+        global_pad = (_alignment - orig_S % _alignment) % _alignment if not is_cross_attn else 0
         if global_pad > 0:
+            # Self-attention only: pad Q/K/V for 32-aligned per-chip seq after all-to-all
             query = F.pad(query, (0, 0, 0, 0, 0, global_pad))  # [B, S+pad, H, D]
-            if not is_cross_attn:
-                key = F.pad(key, (0, 0, 0, 0, 0, global_pad))
-                value = F.pad(value, (0, 0, 0, 0, 0, global_pad))
-            # Cross-attn: K/V are T5 with 512 tokens (32-aligned) -- no padding needed
+            key = F.pad(key, (0, 0, 0, 0, 0, global_pad))
+            value = F.pad(value, (0, 0, 0, 0, 0, global_pad))
             print(
                 f"  [Ulysses DEBUG] post-RoPE pad: seq {orig_S} -> {orig_S + global_pad}"
             )
