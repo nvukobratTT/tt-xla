@@ -1116,11 +1116,14 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
         # With SPMD + TP, XLA will compile sharded graphs -- each device only compiles
         # for its shard of the attention heads (10 heads instead of 40)
         #
-        # TASK-074 FIX: Pad hidden_states ONCE before the block loop.
+        # TASK-074 FIX: Pad hidden_states + timestep_proj ONCE before the block loop.
         # Per-block F.pad on a seq-sharded tensor causes asymmetric Q/K shapes
         # after Ulysses all-to-all -> TTNN decomposes SDPA to matmul+TypecastOp
         # with full O(seq^2) QK^T (21.47 GB) -> OOM on Block 2+.
         # Padding once keeps seq=32768 for all 40 blocks (global_pad==0 in attn).
+        # ALSO pad timestep_proj: for WAN 14B SP mode, timestep_proj is 4D
+        # [B, seq, 6, inner_dim] -- must match hidden_states seq for
+        # broadcasting in WanTransformerBlock (scale_msa/shift_msa + hidden_states).
         _hidden_states_orig_seq = None
         if _sp_mode:
             _ph3_align = 32 * num_devices
@@ -1132,6 +1135,14 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
                 import torch.nn.functional as _F3
                 hidden_states = _F3.pad(hidden_states, (0, 0, 0, _ph3_pad))
                 xs.mark_sharding(hidden_states, mesh, (None, "model", None))
+                # Also pad timestep_proj if it has a seq dim matching hidden_states.
+                # SP mode: timestep_proj is [B, seq, 6, inner_dim] (4D) for WAN 14B;
+                # gets broadcast with hidden_states in scale_msa/shift_msa.
+                if timestep_proj.ndim == 4 and timestep_proj.shape[1] == _hs_seq:
+                    # Pad seq dim (dim 1) of [B, seq, 6, inner_dim]
+                    # F.pad spec from last dim: (d3_l, d3_r, d2_l, d2_r, d1_l, d1_r, ...)
+                    timestep_proj = _F3.pad(timestep_proj, (0, 0, 0, 0, 0, _ph3_pad, 0, 0))
+                    print(f"    [TASK-074] Also padded timestep_proj: {timestep_proj.shape}", flush=True)
         for i, block in enumerate(self.blocks):
             block_start = time.time()
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
