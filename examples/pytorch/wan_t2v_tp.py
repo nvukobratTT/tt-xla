@@ -456,7 +456,10 @@ class WanUlyssesAttnProcessor:
         # Cross-attention: asymmetric Q/K shapes (Q_len=~33024 ≠ K_len=226/512).
         # tt.SDPA hangs for asymmetric shapes (tt-mlir TOOLS.md); use matmul fallback.
         if not is_cross_attn:
-            # Self-attention: runtime streaming handles memory (q_chunk_size=128).
+            # TASK-080: Force SDPA into its own compilation unit. Without mark_step(),
+            # Shardy decomposes tt.scaled_dot_product_attention CustomCall into
+            # matmul+TypecastOp+softmax, allocating O(seq^2) 21.47 GB -> OOM Block 2.
+            xm.mark_step()  # Flush QKV/all-to-all-1 graph before SDPA
             hidden_states_out = tt_sdpa(query, key, value, is_causal=False)
         else:
             # Cross-attention: decomposed matmul (asymmetric seq lengths).
