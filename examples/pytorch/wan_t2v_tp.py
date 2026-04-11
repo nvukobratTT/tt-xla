@@ -1143,6 +1143,27 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
                     # F.pad spec from last dim: (d3_l, d3_r, d2_l, d2_r, d1_l, d1_r, ...)
                     timestep_proj = _F3.pad(timestep_proj, (0, 0, 0, 0, 0, _ph3_pad, 0, 0))
                     print(f"    [TASK-074] Also padded timestep_proj: {timestep_proj.shape}", flush=True)
+                # Also pad rotary_emb (RoPE freqs) if it has a seq dim matching hidden_states.
+                # rotary_emb is a tuple (freqs_cos, freqs_sin) with shape [B, seq, 1, head_dim/2].
+                # Pad with zeros -- extra tokens are trimmed after the block loop anyway.
+                if isinstance(rotary_emb, (tuple, list)) and len(rotary_emb) == 2:
+                    fc, fs = rotary_emb
+                    # Find which dim is seq (== _hs_seq) -- typically dim 1 for [B, seq, 1, D]
+                    # or dim 0 for [seq, 1, D]
+                    _seq_dim = None
+                    for _di, _ds in enumerate(fc.shape):
+                        if _ds == _hs_seq:
+                            _seq_dim = _di
+                            break
+                    if _seq_dim is not None:
+                        # Build pad spec: pad only the seq dim on the right
+                        _pad_spec = [0] * (fc.ndim * 2)
+                        # F.pad spec is reversed (last dim first)
+                        _pad_spec[2 * (fc.ndim - 1 - _seq_dim) + 1] = _ph3_pad
+                        fc = _F3.pad(fc, _pad_spec)
+                        fs = _F3.pad(fs, _pad_spec)
+                        rotary_emb = (fc, fs)
+                        print(f"    [TASK-074] Also padded rotary_emb: {fc.shape}", flush=True)
         for i, block in enumerate(self.blocks):
             block_start = time.time()
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
