@@ -274,8 +274,13 @@ class WanUlyssesAttnProcessor:
       1. Before SDPA: [B, seq/N, heads, d] → [B, heads/N, seq, d]  per device
       2. After SDPA:  [B, heads/N, seq, d] → [B, seq/N, heads, d]  per device
 
-    SDPA padding: 480×832 81f has seq=32,760 (not 32-aligned).
-      Pads to 32,768 (+8 tokens) for TT SDPA, trims output after.
+    SDPA padding: 480×832 81f has seq=32,760 (not 32-aligned per chip: 8,190).
+      Pads per-chip seq 8,190 -> 8,192 BEFORE all-to-all (pre-alltoall padding).
+      After all-to-all: global Sk = 4 x 8,192 = 32,768 (32-aligned).
+      This enables TTNN streaming compute (Flash Attn 2), cutting SDPA memory
+      from 21.47 GB (O(seq^2)) to ~1.7 GB (O(chunk*seq)), preventing OOM.
+      Key: padding BEFORE mark_sharding avoids losing SPMD sharding annotations.
+      Output is trimmed back to original seq after the output projection.
 
     Cross-attention: Q is seq-sharded; encoder K/V are replicated (T5 seq=512).
       Q: all-to-all → head-sharded [B, heads/N, seq, d]
@@ -287,21 +292,26 @@ class WanUlyssesAttnProcessor:
         self.num_devices = num_devices
         self.full_seq_len = full_seq_len
         self.sdpa_chunk_size = sdpa_chunk_size
-        self.pad_len = (32 - full_seq_len % 32) % 32
-        self.padded_seq = full_seq_len + self.pad_len
+        # Per-chip padding: pad per-chip seq to 32-aligned BEFORE all-to-all.
+        # This ensures global Sk = num_devices * padded_per_chip is 32-aligned,
+        # enabling TTNN streaming compute (Flash Attention 2) without losing
+        # sharding annotations (F.pad AFTER mark_sharding drops annotations).
+        seq_per_chip = full_seq_len // num_devices
+        self.pad_len = (32 - seq_per_chip % 32) % 32  # per-chip padding
+        self.padded_seq = full_seq_len + self.pad_len * num_devices
         if self.pad_len > 0:
             print(
-                f"  [Ulysses] seq={full_seq_len} not 32-aligned; "
-                f"padding to {self.padded_seq} for TT SDPA"
+                f"  [Ulysses] seq={full_seq_len} (per-chip={seq_per_chip}) not 32-aligned; "
+                f"padding per-chip +{self.pad_len} -> global padded={self.padded_seq} for TT SDPA"
             )
         else:
-            print(f"  [Ulysses] seq={full_seq_len} is 32-aligned — no padding")
+            print(f"  [Ulysses] seq={full_seq_len} (per-chip={seq_per_chip}) is 32-aligned -- no padding")
         if sdpa_chunk_size > 0:
             n_chunks = (self.padded_seq + sdpa_chunk_size - 1) // sdpa_chunk_size
             peak_gb = sdpa_chunk_size * self.padded_seq * 10 * 2 / 1e9
             print(
                 f"  [Ulysses] chunked SDPA enabled: chunk_size={sdpa_chunk_size}, "
-                f"n_chunks={n_chunks}, peak_SDPA≈{peak_gb:.2f} GB/chip"
+                f"n_chunks={n_chunks}, peak_SDPA~{peak_gb:.2f} GB/chip"
             )
 
     def __call__(
@@ -317,6 +327,16 @@ class WanUlyssesAttnProcessor:
         from diffusers.models.transformers.transformer_wan import _get_qkv_projections
 
         is_cross_attn = encoder_hidden_states is not None
+
+        # -- Pre-all-to-all padding: pad per-chip seq to 32-aligned ----------------
+        # Pad hidden_states BEFORE mark_sharding to avoid losing sharding
+        # annotations (F.pad AFTER mark_sharding drops SPMD sharding metadata).
+        # After all-to-all, global Sk = num_devices * padded_per_chip is 32-aligned,
+        # enabling TTNN streaming compute (Flash Attention 2) which reduces SDPA
+        # memory from O(seq^2) to O(chunk*seq), preventing OOM for 81f @ 480x832.
+        orig_S = hidden_states.shape[1]  # per-chip seq before padding
+        if self.pad_len > 0:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, self.pad_len))
 
         # ── QKV projections ───────────────────────────────────────────────────
         # hidden_states: [B, seq/N, inner_dim]  (seq-sharded)
@@ -374,24 +394,19 @@ class WanUlyssesAttnProcessor:
             value = value.transpose(1, 2)
             xs.mark_sharding(value, self.mesh, (None, "model", None, None))
 
-        # ── TT SDPA ───────────────────────────────────────────────────────────
-        q_seq = query.shape[2]   # full_seq_len after all-to-all
-
-        if self.pad_len > 0:
-            query = F.pad(query, (0, 0, 0, self.pad_len))
-            if not is_cross_attn:
-                key = F.pad(key, (0, 0, 0, self.pad_len))
-                value = F.pad(value, (0, 0, 0, self.pad_len))
-            # Cross-attn: only Q is padded; K/V have T5_seq (no padding needed)
+        # -- TT SDPA ------------------------------------------------------------------
+        # Note: no post-alltoall padding needed here -- hidden_states was already
+        # padded BEFORE all-to-all so Q/K/V arrive already 32-aligned.
+        print(
+            f"  [Ulysses DEBUG] SDPA shapes: "
+            f"Q={tuple(query.shape)} K={tuple(key.shape)} V={tuple(value.shape)}"
+        )
 
         hidden_states_out = chunked_tt_sdpa(
             query, key, value,
             chunk_size=self.sdpa_chunk_size,
             is_causal=False,
         )
-
-        if self.pad_len > 0:
-            hidden_states_out = hidden_states_out[:, :, :q_seq, :]   # trim padding
 
         # ── ALL-TO-ALL 2: head-sharding → seq-sharding ────────────────────────
         # [B, heads/N, seq, head_dim] sharded on dim-1.
@@ -403,11 +418,14 @@ class WanUlyssesAttnProcessor:
         xs.mark_sharding(hidden_states_out, self.mesh, (None, "model", None, None))
         # → [B, seq/N, heads, head_dim] per device
 
-        # ── Flatten + output projection ───────────────────────────────────────
-        hidden_states_out = hidden_states_out.flatten(2, 3)    # [B, seq/N, inner_dim]
+        # -- Flatten + output projection -----------------------------------------------
+        hidden_states_out = hidden_states_out.flatten(2, 3)    # [B, seq/N+pad, inner_dim]
         hidden_states_out = hidden_states_out.type_as(query)
-        hidden_states_out = attn.to_out[0](hidden_states_out)  # [B, seq/N, inner_dim]
+        hidden_states_out = attn.to_out[0](hidden_states_out)  # [B, seq/N+pad, inner_dim]
         hidden_states_out = attn.to_out[1](hidden_states_out)
+        # Trim padding tokens added before all-to-all (restores original per-chip seq)
+        if self.pad_len > 0:
+            hidden_states_out = hidden_states_out[:, :orig_S, :]   # [B, seq/N, inner_dim]
         return hidden_states_out
 
 
@@ -1037,6 +1055,19 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
         xm.mark_step()
 
         # === Phase 3: Transformer blocks with graph breaks ===
+        # Pad hidden_states seq to next multiple of 128 for faster XLA SPMD compilation.
+        # For 81f: seq=32760 -> padded to 32768 (32768/4=8192=2^13, tile-aligned).
+        # Avoids O(seq^3) SPMD compiler behavior for non-tile-aligned sequences.
+        _actual_full_seq = hidden_states.shape[1]  # global shape (lazy XLA)
+        _pad_to_128 = ((_actual_full_seq + 127) // 128) * 128
+        _seq_pad_128 = _pad_to_128 - _actual_full_seq
+        if _seq_pad_128 > 0:
+            import torch.nn.functional as _F
+            hidden_states = _F.pad(hidden_states, (0, 0, 0, _seq_pad_128))
+            if _sp_mode:
+                xs.mark_sharding(hidden_states, mesh, (None, "model", None))
+            print(f"    [SP pad] seq {_actual_full_seq} to {_pad_to_128} (+{_seq_pad_128})", flush=True)
+
         # With SPMD + TP, XLA will compile sharded graphs — each device only compiles
         # for its shard of the attention heads (10 heads instead of 40)
         for i, block in enumerate(self.blocks):
