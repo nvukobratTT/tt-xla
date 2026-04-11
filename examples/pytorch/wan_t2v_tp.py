@@ -328,16 +328,6 @@ class WanUlyssesAttnProcessor:
 
         is_cross_attn = encoder_hidden_states is not None
 
-        # -- Pre-all-to-all padding: pad per-chip seq to 32-aligned ----------------
-        # Pad hidden_states BEFORE mark_sharding to avoid losing sharding
-        # annotations (F.pad AFTER mark_sharding drops SPMD sharding metadata).
-        # After all-to-all, global Sk = num_devices * padded_per_chip is 32-aligned,
-        # enabling TTNN streaming compute (Flash Attention 2) which reduces SDPA
-        # memory from O(seq^2) to O(chunk*seq), preventing OOM for 81f @ 480x832.
-        orig_S = hidden_states.shape[1]  # global seq before padding
-        if self.pad_len > 0:
-            hidden_states = F.pad(hidden_states, (0, 0, 0, self.pad_len * self.num_devices))
-
         # ── QKV projections ───────────────────────────────────────────────────
         # hidden_states: [B, seq/N, inner_dim]  (seq-sharded)
         # encoder_hidden_states: [B, T5_seq, inner_dim]  (replicated, cross-attn only)
@@ -364,6 +354,24 @@ class WanUlyssesAttnProcessor:
                 return out.type_as(x)
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
+
+        # Post-RoPE padding: align global seq to next multiple of (32 * num_devices)
+        # BEFORE mark_sharding/all-to-all. This ensures per-chip K/Q seq is 32-aligned
+        # after the all-to-all, enabling TTNN streaming compute (Flash Attn 2).
+        # Padding AFTER RoPE avoids rotary_emb shape mismatch (RoPE uses original seq).
+        # Padding BEFORE mark_sharding preserves SPMD sharding annotations.
+        orig_S = query.shape[1]  # global seq after QKV/RoPE, before padding
+        _alignment = 32 * self.num_devices  # 128 for 4-device mesh
+        global_pad = (_alignment - orig_S % _alignment) % _alignment
+        if global_pad > 0:
+            query = F.pad(query, (0, 0, 0, 0, 0, global_pad))  # [B, S+pad, H, D]
+            if not is_cross_attn:
+                key = F.pad(key, (0, 0, 0, 0, 0, global_pad))
+                value = F.pad(value, (0, 0, 0, 0, 0, global_pad))
+            # Cross-attn: K/V are T5 with 512 tokens (32-aligned) -- no padding needed
+            print(
+                f"  [Ulysses DEBUG] post-RoPE pad: seq {orig_S} -> {orig_S + global_pad}"
+            )
 
         # ── ALL-TO-ALL 1: seq-sharding → head-sharding ────────────────────────
         # Q is [B, seq/N, heads, head_dim] sharded on dim-1.
@@ -423,9 +431,9 @@ class WanUlyssesAttnProcessor:
         hidden_states_out = hidden_states_out.type_as(query)
         hidden_states_out = attn.to_out[0](hidden_states_out)  # [B, seq/N+pad, inner_dim]
         hidden_states_out = attn.to_out[1](hidden_states_out)
-        # Trim padding tokens added before all-to-all (restores original per-chip seq)
-        if self.pad_len > 0:
-            hidden_states_out = hidden_states_out[:, :orig_S, :]   # [B, seq/N, inner_dim]
+        # Trim padding tokens back to original seq (restores global seq=orig_S)
+        if global_pad > 0:
+            hidden_states_out = hidden_states_out[:, :orig_S, :]   # [B, seq, inner_dim]
         return hidden_states_out
 
 
@@ -1055,25 +1063,7 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
         xm.mark_step()
 
         # === Phase 3: Transformer blocks with graph breaks ===
-        # Pad hidden_states seq to next multiple of 128 for faster XLA SPMD compilation.
-        # For 81f: seq=32760 -> padded to 32768 (32768/4=8192=2^13, tile-aligned).
-        # Avoids O(seq^3) SPMD compiler behavior for non-tile-aligned sequences.
-        # Also pad timestep_proj (seq-indexed for Wan2.1) to avoid broadcast mismatch.
-        _actual_full_seq = hidden_states.shape[1]  # global shape (lazy XLA)
-        _pad_to_128 = ((_actual_full_seq + 127) // 128) * 128
-        _seq_pad_128 = _pad_to_128 - _actual_full_seq
-        if _seq_pad_128 > 0:
-            import torch.nn.functional as _F
-            hidden_states = _F.pad(hidden_states, (0, 0, 0, _seq_pad_128))
-            if _sp_mode:
-                xs.mark_sharding(hidden_states, mesh, (None, "model", None))
-            # Pad timestep_proj seq dim if it is seq-indexed (4D: [B, seq, 6, D])
-            if timestep_proj.ndim == 4:
-                timestep_proj = _F.pad(timestep_proj, (0, 0, 0, 0, 0, _seq_pad_128))
-                if _sp_mode:
-                    xs.mark_sharding(timestep_proj, mesh, (None, "model", None, None))
-            print(f"    [SP pad] seq {_actual_full_seq} to {_pad_to_128} (+{_seq_pad_128})", flush=True)
-        # With SPMD + TP, XLA will compile sharded graphs — each device only compiles
+        # With SPMD + TP, XLA will compile sharded graphs -- each device only compiles
         # for its shard of the attention heads (10 heads instead of 40)
         for i, block in enumerate(self.blocks):
             block_start = time.time()
@@ -1081,13 +1071,6 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
             xm.mark_step()
             block_time = time.time() - block_start
             print(f"      Block {i+1}/{len(self.blocks)} done ({block_time:.1f}s)", flush=True)
-
-        # Trim hidden_states back to original seq if [SP pad] was applied
-        if _seq_pad_128 > 0:
-            hidden_states = hidden_states[:, :_actual_full_seq, :]
-            if _sp_mode:
-                xs.mark_sharding(hidden_states, mesh, (None, "model", None))
-            print(f"    [SP trim] trimmed back to seq={_actual_full_seq}", flush=True)
 
         # === Phase 4: Output projection ===
         # In SP mode, hidden_states is [B, seq/N, dim] per chip (seq-sharded).
