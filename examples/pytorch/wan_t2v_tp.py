@@ -231,6 +231,34 @@ def chunked_tt_sdpa(query, key, value, chunk_size: int = 0, is_causal: bool = Fa
     seq_k = key.shape[2]
     # Skip chunking if: disabled, fits in one chunk, or K/V seq is tiny
     # (cross-attention has seq_k=226 - no benefit to chunking)
+    # Asymmetric Q/K shapes crash in tt.scaled_dot_product_attention (Error code 13 at
+    # runtime or 20+ min hang in tt-mlir compilation). Use decomposed fallback.
+    # Also pad Q to 32-aligned since TTNN matmul requires tile-aligned dimensions.
+    if seq_q != seq_k:
+        import math as _math
+        import torch.nn.functional as _F
+        # Pad Q to 32-aligned (TTNN tile requirement for matmul kernels)
+        pad_q = (32 - seq_q % 32) % 32
+        q_padded = _F.pad(query, (0, 0, 0, pad_q)) if pad_q > 0 else query
+        _scale = 1.0 / _math.sqrt(q_padded.shape[-1])
+        scores = torch.matmul(q_padded, key.transpose(-2, -1)) * _scale
+        weights = torch.nn.functional.softmax(scores.float(), dim=-1).to(query.dtype)
+        out = torch.matmul(weights, value)
+        if pad_q > 0:
+            out = out[:, :, :seq_q, :]  # trim padded Q tokens
+        print(f"  [chunked_tt_sdpa] asymmetric fallback: Q_seq={seq_q} (padded+{pad_q}), K_seq={seq_k}")
+        return out
+    # TTNN streaming compute (Flash Attention 2) requires q_chunk_size>=64 to activate.
+    # This parameter is not configurable via the tt_sdpa Python API; without it,
+    # TTNN allocates the full O(seq^2) QK^T buffer which is 21.47 GB for seq=32768
+    # and causes OOM on Blackhole (only ~21 GB free after model weights).
+    # Workaround: auto-enable Python-level chunking for large symmetric SDPA.
+    # Each chunk: [1,H,chunk_size,Sk] bf16 = 335 MB/chip (4096 chunks of seq=32768).
+    _AUTO_CHUNK_THRESHOLD = 4096
+    _AUTO_CHUNK_SIZE = 4096  # tile-aligned (4096 % 32 == 0), 335 MB/chip per chunk
+    if chunk_size <= 0 and seq_q > _AUTO_CHUNK_THRESHOLD:
+        chunk_size = _AUTO_CHUNK_SIZE
+        print(f"  [chunked_tt_sdpa] auto-chunking: seq={seq_q} > {_AUTO_CHUNK_THRESHOLD}, chunk_size={chunk_size}")
     if chunk_size <= 0 or seq_q <= chunk_size or seq_k <= chunk_size:
         return tt_sdpa(query, key, value, is_causal=is_causal)
 
@@ -327,6 +355,7 @@ class WanUlyssesAttnProcessor:
         from diffusers.models.transformers.transformer_wan import _get_qkv_projections
 
         is_cross_attn = encoder_hidden_states is not None
+        print(f"  [Ulysses DEBUG] __call__ entry: hidden_states.shape={hidden_states.shape} is_cross_attn={is_cross_attn}")
 
         # ── QKV projections ───────────────────────────────────────────────────
         # hidden_states: [B, seq/N, inner_dim]  (seq-sharded)
@@ -373,6 +402,12 @@ class WanUlyssesAttnProcessor:
             print(
                 f"  [Ulysses DEBUG] post-RoPE pad: seq {orig_S} -> {orig_S + global_pad}"
             )
+            # TASK-074: Re-annotate seq-sharding after F.pad to ensure SPMD redistributes
+            # evenly (8192/chip for seq=32768) rather than keeping uneven shards.
+            # Without this, the all-to-all may see mismatched Q/K seq lengths.
+            xs.mark_sharding(query, self.mesh, (None, "model", None, None))
+            xs.mark_sharding(key, self.mesh, (None, "model", None, None))
+            xs.mark_sharding(value, self.mesh, (None, "model", None, None))
 
         # ── ALL-TO-ALL 1: seq-sharding → head-sharding ────────────────────────
         # Q is [B, seq/N, heads, head_dim] sharded on dim-1.
@@ -411,11 +446,25 @@ class WanUlyssesAttnProcessor:
             f"Q={tuple(query.shape)} K={tuple(key.shape)} V={tuple(value.shape)}"
         )
 
-        hidden_states_out = chunked_tt_sdpa(
-            query, key, value,
-            chunk_size=self.sdpa_chunk_size,
-            is_causal=False,
-        )
+        # TASK-072: Use tt_sdpa directly for self-attention so the runtime's
+        # q_chunk_size=128 setting (in runScaledDotProductAttentionOp) enables
+        # Flash Attention 2 streaming compute (O(q_chunk*Sk) memory vs O(Sq*Sk)).
+        # Python-level chunking via chunked_tt_sdpa auto-chunks to 4096 but those
+        # chunks get FUSED into one SPMD graph, allocating all intermediates at once:
+        # 8 chunks × 2.68 GB = 21.47 GB → OOM. Calling tt_sdpa directly lets the
+        # TTNN kernel handle streaming internally with q_chunk_size=128.
+        # Cross-attention: asymmetric Q/K shapes (Q_len=~33024 ≠ K_len=226/512).
+        # tt.SDPA hangs for asymmetric shapes (tt-mlir TOOLS.md); use matmul fallback.
+        if not is_cross_attn:
+            # Self-attention: runtime streaming handles memory (q_chunk_size=128).
+            hidden_states_out = tt_sdpa(query, key, value, is_causal=False)
+        else:
+            # Cross-attention: decomposed matmul (asymmetric seq lengths).
+            hidden_states_out = chunked_tt_sdpa(
+                query, key, value,
+                chunk_size=0,
+                is_causal=False,
+            )
 
         # ── ALL-TO-ALL 2: head-sharding → seq-sharding ────────────────────────
         # [B, heads/N, seq, head_dim] sharded on dim-1.
@@ -1066,12 +1115,34 @@ def patch_transformer_with_tp(transformer, mesh, num_devices, sp_mode=False):
         # === Phase 3: Transformer blocks with graph breaks ===
         # With SPMD + TP, XLA will compile sharded graphs -- each device only compiles
         # for its shard of the attention heads (10 heads instead of 40)
+        #
+        # TASK-074 FIX: Pad hidden_states ONCE before the block loop.
+        # Per-block F.pad on a seq-sharded tensor causes asymmetric Q/K shapes
+        # after Ulysses all-to-all -> TTNN decomposes SDPA to matmul+TypecastOp
+        # with full O(seq^2) QK^T (21.47 GB) -> OOM on Block 2+.
+        # Padding once keeps seq=32768 for all 40 blocks (global_pad==0 in attn).
+        _hidden_states_orig_seq = None
+        if _sp_mode:
+            _ph3_align = 32 * num_devices
+            _hs_seq = hidden_states.shape[1]
+            _ph3_pad = (_ph3_align - _hs_seq % _ph3_align) % _ph3_align
+            if _ph3_pad > 0:
+                print(f"    [TASK-074] Pre-loop pad: seq {_hs_seq}->{_hs_seq+_ph3_pad}", flush=True)
+                _hidden_states_orig_seq = _hs_seq
+                import torch.nn.functional as _F3
+                hidden_states = _F3.pad(hidden_states, (0, 0, 0, _ph3_pad))
+                xs.mark_sharding(hidden_states, mesh, (None, "model", None))
         for i, block in enumerate(self.blocks):
             block_start = time.time()
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
             xm.mark_step()
             block_time = time.time() - block_start
             print(f"      Block {i+1}/{len(self.blocks)} done ({block_time:.1f}s)", flush=True)
+
+        # TASK-074: Trim the pre-loop padding back to original seq length
+        if _sp_mode and _hidden_states_orig_seq is not None:
+            print(f"    [TASK-074] Post-loop trim: seq {hidden_states.shape[1]}->{_hidden_states_orig_seq}", flush=True)
+            hidden_states = hidden_states[:, :_hidden_states_orig_seq, :]
 
         # === Phase 4: Output projection ===
         # In SP mode, hidden_states is [B, seq/N, dim] per chip (seq-sharded).
